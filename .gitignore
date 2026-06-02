@@ -3,3 +3,19 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+
+# Local editor state
+.vscode/
+
+# Runtime scratch files
+temp_*.jpg
+scripts/temp_*.jpg
+
+# Model weights and training artifacts
+*.pt
+runs/
+
+# Downloaded/generated datasets
+5cls_v7-1/
+data/roboflow_tankkk2_finetune/
+*.cache
