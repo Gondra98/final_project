@@ -1,28 +1,54 @@
-# Tank Autonomous Driving Project
+# TankSimulation
 
-전차 시뮬레이터 환경에서 장애물 회피 및 강화학습 기반 자율주행 경로 생성을 구현하는 프로젝트입니다.
+Tank simulator API server and YOLO perception utilities.
 
-## Goals
+## Project Layout
 
-- 시뮬레이터 API 연동
-- 라이다 및 장애물 데이터 분석
-- 장애물 회피 알고리즘 구현
-- 강화학습 기반 경로 생성
-- 주행 성능 평가 및 시각화
+- `configs/`: simulator connection settings
+- `docs/`: project and API notes
+- `scripts/run_yolo_server.py`: Flask server with YOLO detection
+- `scripts/run_simulator_client.py`: simulator client entrypoint
+- `scripts/train_yolo_wall_detector.py`: Roboflow dataset merge and YOLO fine-tuning script
+- `src/`: reusable simulator, perception, planning, and RL modules
+- `tests/`: automated tests
 
-## Project Structure
-
-- `src/simulator`: 시뮬레이터 API 통신
-- `src/perception`: 장애물 데이터 처리
-- `src/planning`: 경로 생성 및 장애물 회피
-- `src/control`: 전차 제어 명령 생성
-- `src/rl`: 강화학습 환경 및 학습 코드
-- `data`: 수집 데이터
-- `models`: 학습된 모델
-- `docs`: 프로젝트 문서
-- `tests`: 테스트 코드
+Generated datasets, training runs, model weights, caches, and editor files are intentionally ignored by Git.
 
 ## Setup
 
 ```bash
 pip install -r requirements.txt
+pip install -r requirements-torch-cu128.txt
+```
+
+## Run The YOLO Server
+
+```bash
+python scripts/run_yolo_server.py
+```
+
+Useful runtime flags:
+
+```bash
+YOLO_TIMING=1 python scripts/run_yolo_server.py
+YOLO_SHADOW_FILTER=0 python scripts/run_yolo_server.py
+YOLO_MODEL_PATH=runs/detect/your_run/weights/best.pt python scripts/run_yolo_server.py
+```
+
+## Train Or Fine-Tune YOLO
+
+Set the Roboflow API key before downloading datasets:
+
+```bash
+export ROBOFLOW_API_KEY=your_key_here
+python scripts/train_yolo_wall_detector.py
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:ROBOFLOW_API_KEY="your_key_here"
+python scripts/train_yolo_wall_detector.py
+```
+
+Do not commit model weights or downloaded datasets. Use Git LFS or a release artifact if the team needs to share trained weights.

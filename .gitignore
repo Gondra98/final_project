@@ -13,9 +13,16 @@ scripts/temp_*.jpg
 
 # Model weights and training artifacts
 *.pt
+*.onnx
+*.mp4
+*.zip
+*.csv
+models/
 runs/
 
 # Downloaded/generated datasets
 5cls_v7-1/
+data/base_tank_dataset/
 data/roboflow_tankkk2_finetune/
+data/yolo_wall_finetune/
 *.cache
