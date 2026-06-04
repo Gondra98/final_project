@@ -80,14 +80,6 @@ Debug the active server state:
 Invoke-RestMethod http://127.0.0.1:5000/debug_state
 ```
 
-Bounding box colors by returned `className`:
-
-- `person`: `#00FFFF`
-- `rock`: `#FFA500`
-- `tank`: `#FF0000`
-- `wall`: `#00FF00`
-- `tent`: `#FFFF00`
-
 Recognition logs print to the console when final `/detect` results contain objects:
 
 ```text
@@ -148,7 +140,6 @@ Use `/debug_state` to separate failure causes:
 
 - `modelPath`: confirms which `best.pt` was loaded
 - `modelNames` and `publicNames`: confirm model class IDs map to returned `className` values
-- `classColors`: confirms returned `color` values for each class
 - `recognitionLogEnabled`: confirms console recognition logging is enabled
 - `latestRawDetectionCount=0`: model path, model quality, or input image issue
 - `latestRawDetectionCount>0` and `latestReturnedDetectionCount=0`: return threshold/filter issue

@@ -27,14 +27,6 @@ CLASS_ALIASES = {
     "tank": "tank",
 }
 IGNORED_CLASSES = {"car"}
-CLASS_COLORS = {
-    "person": "#00FFFF",
-    "rock": "#FFA500",
-    "tank": "#FF0000",
-    "wall": "#00FF00",
-    "tent": "#FFFF00",
-}
-DEFAULT_BOX_COLOR = "#00FF00"
 MODEL_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_MODEL_CONF", "0.10"))
 FALLBACK_MODEL_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_FALLBACK_MODEL_CONF", "0.05"))
 DEFAULT_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_DEFAULT_CONF", "0.20"))
@@ -101,11 +93,6 @@ def normalize_model_names(names):
 def normalize_public_class_name(class_name):
     class_name = str(class_name).strip().lower()
     return CLASS_ALIASES.get(class_name, class_name)
-
-
-def get_box_color(class_name: str) -> str:
-    normalized = str(class_name).strip().lower()
-    return CLASS_COLORS.get(normalized, DEFAULT_BOX_COLOR)
 
 
 def get_public_class_name(class_id):
@@ -501,7 +488,7 @@ def make_detection_response(class_name, box, confidence):
         "className": class_name,
         "bbox": [float(coord) for coord in box[:4]],
         "confidence": confidence,
-        "color": get_box_color(class_name),
+        "color": "#00FF00",
         "filled": False,
         "updateBoxWhileMoving": False,
     }
@@ -557,8 +544,6 @@ def get_debug_state_payload():
         "classThresholds": CLASS_CONFIDENCE_THRESHOLDS,
         "closeWallConf": CLOSE_WALL_CONFIDENCE_THRESHOLD,
         "ignoredClasses": sorted(IGNORED_CLASSES),
-        "classColors": CLASS_COLORS,
-        "defaultBoxColor": DEFAULT_BOX_COLOR,
         "recognitionLogEnabled": YOLO_RECOGNITION_LOG,
         "recognitionLogCacheEnabled": YOLO_RECOGNITION_LOG_CACHE,
         "recognitionLogEmptyEnabled": YOLO_RECOGNITION_LOG_EMPTY,
