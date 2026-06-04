@@ -42,9 +42,6 @@ IGNORED_CLASSES = {"car"}
 MODEL_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_MODEL_CONF", "0.10"))
 FALLBACK_MODEL_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_FALLBACK_MODEL_CONF", "0.05"))
 DEFAULT_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_DEFAULT_CONF", "0.20"))
-CLASS_CONFIDENCE_THRESHOLDS = {
-    "wall": float(os.getenv("YOLO_WALL_CONF", "0.15")),
-}
 CLOSE_WALL_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_CLOSE_WALL_CONF", "0.12"))
 CLOSE_WALL_AREA_RATIO = float(os.getenv("YOLO_CLOSE_WALL_AREA_RATIO", "0.08"))
 CLOSE_WALL_MIN_HEIGHT_RATIO = float(os.getenv("YOLO_CLOSE_WALL_MIN_HEIGHT_RATIO", "0.35"))
@@ -151,11 +148,9 @@ def evaluate_detection_for_return(class_name, confidence, box, frame_shape, bypa
         return True, None, None
     if is_close_wall_candidate(class_name, confidence, box, frame_shape):
         return True, None, CLOSE_WALL_CONFIDENCE_THRESHOLD
-    threshold = CLASS_CONFIDENCE_THRESHOLDS.get(class_name, DEFAULT_CONFIDENCE_THRESHOLD)
+    threshold = DEFAULT_CONFIDENCE_THRESHOLD
     if confidence >= threshold:
         return True, None, threshold
-    if class_name in CLASS_CONFIDENCE_THRESHOLDS:
-        return False, "below_class_threshold", threshold
     return False, "below_default_threshold", threshold
 
 
@@ -233,7 +228,6 @@ print(
     f"device={YOLO_DEVICE}, half={YOLO_HALF}, imgsz={YOLO_IMGSZ}, "
     f"model_conf={MODEL_CONFIDENCE_THRESHOLD}, default_conf={DEFAULT_CONFIDENCE_THRESHOLD}, "
     f"fallback_conf={FALLBACK_MODEL_CONFIDENCE_THRESHOLD}, low_conf_fallback={YOLO_LOW_CONF_FALLBACK}, "
-    f"wall_conf={CLASS_CONFIDENCE_THRESHOLDS['wall']}, "
     f"max_det={YOLO_MAX_DET}, max_return={MAX_RETURN_DETECTIONS}, "
     f"cache={ENABLE_DETECT_CACHE}, min_interval={YOLO_MIN_INTERVAL}, "
     f"bypass_return_filter={YOLO_BYPASS_RETURN_FILTER}, "
@@ -462,7 +456,6 @@ def get_debug_state_payload():
         "lowConfFallbackEnabled": YOLO_LOW_CONF_FALLBACK,
         "returnFallbackDetections": YOLO_RETURN_FALLBACK_DETECTIONS,
         "defaultConf": DEFAULT_CONFIDENCE_THRESHOLD,
-        "classThresholds": CLASS_CONFIDENCE_THRESHOLDS,
         "closeWallConf": CLOSE_WALL_CONFIDENCE_THRESHOLD,
         "ignoredClasses": sorted(IGNORED_CLASSES),
         "recognitionLogEnabled": YOLO_RECOGNITION_LOG,

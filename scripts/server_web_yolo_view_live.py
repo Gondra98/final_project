@@ -1,0 +1,478 @@
+"""
+Tank simulator -> Flask -> Web live view + async YOLO(best.pt)
+
+핵심 구조
+- /detect: 시뮬레이터 이미지 수신 후 원본 프레임을 즉시 latest_frame에 저장하고 바로 최신 detection을 반환
+- yolo_worker: 백그라운드에서 최신 프레임 1장만 YOLO 추론
+- /view: 최신 원본 프레임 + 최신 bbox를 그려서 웹으로 스트리밍
+
+웹에서 YOLO를 다시 실행하지 않는다.
+"""
+
+from __future__ import annotations
+
+import os
+import time
+from pathlib import Path
+from threading import Condition, Lock, Thread
+from typing import Any, Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+import torch
+from flask import Flask, Response, jsonify, render_template_string, request
+from ultralytics import YOLO
+
+# =========================
+# 환경 설정
+# =========================
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_MODEL_PATH = SCRIPT_DIR / "best.pt"
+YOLO_MODEL_PATH = Path(os.getenv("YOLO_MODEL_PATH", str(DEFAULT_MODEL_PATH)))
+if not YOLO_MODEL_PATH.is_absolute():
+    YOLO_MODEL_PATH = (SCRIPT_DIR / YOLO_MODEL_PATH).resolve()
+
+HOST = os.getenv("SERVER_HOST", "0.0.0.0")
+PORT = int(os.getenv("SERVER_PORT", "5000"))
+
+YOLO_DEVICE = os.getenv("YOLO_DEVICE", "0" if torch.cuda.is_available() else "cpu")
+USE_CUDA = torch.cuda.is_available() and YOLO_DEVICE.lower() != "cpu"
+YOLO_HALF = os.getenv("YOLO_HALF", "true").lower() in {"1", "true", "yes", "on"} and USE_CUDA
+YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "416"))
+YOLO_CONF = float(os.getenv("YOLO_CONF", "0.20"))
+YOLO_IOU = float(os.getenv("YOLO_IOU", "0.70"))
+YOLO_MAX_DET = int(os.getenv("YOLO_MAX_DET", "30"))
+
+WEB_FPS = float(os.getenv("WEB_FPS", "20"))
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "80"))
+DETECT_MODE = os.getenv("SIM_DETECT_MODE", "true").lower() in {"1", "true", "yes", "on"}
+PRINT_TIMING_LOG = os.getenv("YOLO_TIMING", "true").lower() in {"1", "true", "yes", "on"}
+PRINT_DETECTION_LOG = os.getenv("YOLO_RECOGNITION_LOG", "false").lower() in {"1", "true", "yes", "on"}
+
+# 선택 옵션: 너무 자주 YOLO를 돌리지 않도록 최소 간격 제한. 0이면 제한 없음.
+YOLO_MIN_INTERVAL = float(os.getenv("YOLO_MIN_INTERVAL", "0.00"))
+
+# =========================
+# Flask / YOLO 초기화
+# =========================
+app = Flask(__name__)
+
+if not YOLO_MODEL_PATH.exists():
+    print(f"[WARNING] YOLO model not found: {YOLO_MODEL_PATH}")
+    print("          YOLO_MODEL_PATH 환경변수 또는 best.pt 위치를 확인하세요.")
+
+print(f"Loading YOLO model: {YOLO_MODEL_PATH}")
+model = YOLO(str(YOLO_MODEL_PATH))
+model_names = model.names if isinstance(model.names, dict) else {i: n for i, n in enumerate(model.names)}
+print(f"Model labels: {model_names}")
+print(
+    "YOLO runtime: "
+    f"device={YOLO_DEVICE}, half={YOLO_HALF}, imgsz={YOLO_IMGSZ}, "
+    f"conf={YOLO_CONF}, iou={YOLO_IOU}, max_det={YOLO_MAX_DET}, "
+    f"web_fps={WEB_FPS}, jpeg_quality={JPEG_QUALITY}"
+)
+
+# =========================
+# 공유 상태
+# =========================
+state_lock = Lock()
+frame_condition = Condition()
+
+latest_frame: Optional[np.ndarray] = None          # 웹에 즉시 보여줄 최신 원본 프레임
+latest_frame_seq: int = 0                         # /detect가 새 프레임을 받을 때마다 증가
+latest_frame_timestamp: float = 0.0
+
+processed_frame_seq: int = 0                      # YOLO가 마지막으로 처리한 프레임 번호
+latest_detections: List[Dict[str, Any]] = []
+latest_yolo_ms: float = 0.0
+latest_post_ms: float = 0.0
+latest_worker_total_ms: float = 0.0
+latest_detect_response_ms: float = 0.0
+latest_decode_ms: float = 0.0
+latest_result_timestamp: float = 0.0
+latest_frame_shape: Optional[List[int]] = None
+latest_error: Optional[str] = None
+request_count: int = 0
+worker_count: int = 0
+
+# =========================
+# 유틸 함수
+# =========================
+def decode_uploaded_image(image_file) -> Optional[np.ndarray]:
+    image_bytes = image_file.read()
+    if not image_bytes:
+        return None
+    image_buffer = np.frombuffer(image_bytes, dtype=np.uint8)
+    return cv2.imdecode(image_buffer, cv2.IMREAD_COLOR)
+
+
+def run_yolo_only(frame: np.ndarray) -> Tuple[List[Dict[str, Any]], float, float]:
+    """YOLO 추론 후 bbox 결과만 반환. 웹용 이미지는 매번 별도로 그림."""
+    yolo_started = time.perf_counter()
+    with torch.inference_mode():
+        results = model.predict(
+            source=frame,
+            conf=YOLO_CONF,
+            imgsz=YOLO_IMGSZ,
+            device=YOLO_DEVICE,
+            half=YOLO_HALF,
+            iou=YOLO_IOU,
+            max_det=YOLO_MAX_DET,
+            verbose=False,
+        )
+        if USE_CUDA:
+            torch.cuda.synchronize()
+    yolo_ms = (time.perf_counter() - yolo_started) * 1000
+
+    post_started = time.perf_counter()
+    detections: List[Dict[str, Any]] = []
+    boxes = results[0].boxes if results and results[0].boxes is not None else None
+    if boxes is not None and len(boxes) > 0:
+        data = boxes.data.detach().cpu().numpy()
+        for box in data:
+            x1, y1, x2, y2, conf, cls_id = box[:6]
+            class_id = int(cls_id)
+            class_name = str(model_names.get(class_id, class_id))
+            detections.append(
+                {
+                    "className": class_name,
+                    "classId": class_id,
+                    "confidence": float(conf),
+                    "bbox": [float(x1), float(y1), float(x2), float(y2)],
+                    "color": "#00FF00",
+                    "filled": False,
+                    "updateBoxWhileMoving": False,
+                }
+            )
+    post_ms = (time.perf_counter() - post_started) * 1000
+    return detections, yolo_ms, post_ms
+
+
+def draw_detections(frame: np.ndarray, detections: List[Dict[str, Any]]) -> np.ndarray:
+    drawn = frame.copy()
+    for det in detections:
+        bbox = det.get("bbox", [])
+        if len(bbox) < 4:
+            continue
+        x1, y1, x2, y2 = map(int, bbox[:4])
+        class_name = det.get("className", "object")
+        conf = float(det.get("confidence", 0.0))
+        cv2.rectangle(drawn, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(
+            drawn,
+            f"{class_name} {conf:.2f}",
+            (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+    # 화면 상태 표시
+    with state_lock:
+        yolo_ms = latest_yolo_ms
+        result_age = time.time() - latest_result_timestamp if latest_result_timestamp else None
+        frame_seq = latest_frame_seq
+        proc_seq = processed_frame_seq
+
+    status = f"frame={frame_seq} yolo_seq={proc_seq} det={len(detections)} yolo={yolo_ms:.1f}ms"
+    if result_age is not None:
+        status += f" age={result_age*1000:.0f}ms"
+    else:
+        status += " age=none"
+
+    cv2.putText(drawn, status, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2, cv2.LINE_AA)
+    return drawn
+
+
+def make_blank_frame(message: str = "Waiting for simulator image...") -> np.ndarray:
+    frame = np.zeros((480, 854, 3), dtype=np.uint8)
+    cv2.putText(frame, message, (40, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+    return frame
+
+# =========================
+# YOLO 백그라운드 worker
+# =========================
+def yolo_worker_loop() -> None:
+    global processed_frame_seq, latest_detections, latest_yolo_ms, latest_post_ms
+    global latest_worker_total_ms, latest_result_timestamp, latest_error, worker_count
+
+    print("YOLO worker started")
+    last_run_time = 0.0
+
+    while True:
+        with frame_condition:
+            frame_condition.wait_for(lambda: latest_frame_seq > processed_frame_seq)
+
+        # 최신 프레임만 복사한다. 중간에 쌓인 오래된 프레임은 버린다.
+        with state_lock:
+            frame = None if latest_frame is None else latest_frame.copy()
+            seq_to_process = latest_frame_seq
+
+        if frame is None:
+            continue
+
+        # 너무 잦은 추론을 제한하고 싶을 때만 사용
+        if YOLO_MIN_INTERVAL > 0:
+            now = time.time()
+            wait_sec = YOLO_MIN_INTERVAL - (now - last_run_time)
+            if wait_sec > 0:
+                time.sleep(wait_sec)
+            last_run_time = time.time()
+
+        started = time.perf_counter()
+        try:
+            detections, yolo_ms, post_ms = run_yolo_only(frame)
+            total_ms = (time.perf_counter() - started) * 1000
+            with state_lock:
+                processed_frame_seq = seq_to_process
+                latest_detections = list(detections)
+                latest_yolo_ms = yolo_ms
+                latest_post_ms = post_ms
+                latest_worker_total_ms = total_ms
+                latest_result_timestamp = time.time()
+                latest_error = None
+                worker_count += 1
+
+            if PRINT_TIMING_LOG:
+                print(
+                    f"[worker] seq={seq_to_process} yolo={yolo_ms:.1f}ms "
+                    f"post={post_ms:.1f}ms total={total_ms:.1f}ms det={len(detections)}"
+                )
+            if PRINT_DETECTION_LOG and detections:
+                for det in detections:
+                    print(f"[det] class={det['className']} conf={det['confidence']:.2f} bbox={det['bbox']}")
+        except Exception as exc:  # noqa: BLE001
+            with state_lock:
+                latest_error = str(exc)
+            print(f"[worker:error] {exc}")
+            time.sleep(0.05)
+
+# =========================
+# 시뮬레이터 API
+# =========================
+@app.route("/detect", methods=["POST"])
+def detect():
+    """
+    시뮬레이터가 호출하는 객체 탐지 API.
+    중요: YOLO를 여기서 기다리지 않는다.
+    1) 이미지 디코딩
+    2) latest_frame 즉시 갱신
+    3) worker 깨우기
+    4) 현재까지의 최신 detection 결과 바로 반환
+    """
+    global latest_frame, latest_frame_seq, latest_frame_timestamp, latest_frame_shape
+    global latest_detect_response_ms, latest_decode_ms, latest_error, request_count
+
+    request_started = time.perf_counter()
+    image = request.files.get("image")
+    if image is None:
+        return jsonify({"error": "No image received"}), 400
+
+    decode_started = time.perf_counter()
+    frame = decode_uploaded_image(image)
+    decode_ms = (time.perf_counter() - decode_started) * 1000
+    if frame is None:
+        with state_lock:
+            latest_error = "Invalid image received"
+        return jsonify({"error": "Invalid image received"}), 400
+
+    with state_lock:
+        request_count += 1
+        latest_frame_seq += 1
+        current_seq = latest_frame_seq
+        latest_frame = frame.copy()  # 웹에서 바로 표시할 원본 프레임을 YOLO 전에 저장
+        latest_frame_timestamp = time.time()
+        latest_frame_shape = [int(v) for v in frame.shape]
+        latest_decode_ms = decode_ms
+        detections_to_return = list(latest_detections)  # 직전 최신 결과
+
+    with frame_condition:
+        frame_condition.notify()
+
+    response_ms = (time.perf_counter() - request_started) * 1000
+    with state_lock:
+        latest_detect_response_ms = response_ms
+        proc_seq = processed_frame_seq
+        result_age = time.time() - latest_result_timestamp if latest_result_timestamp else None
+
+    if PRINT_TIMING_LOG:
+        age_text = "none" if result_age is None else f"{result_age*1000:.1f}ms"
+        print(
+            f"[/detect] enqueue_seq={current_seq} return_seq={proc_seq} "
+            f"decode={decode_ms:.1f}ms response={response_ms:.1f}ms "
+            f"result_age={age_text} det={len(detections_to_return)}"
+        )
+
+    return jsonify(detections_to_return)
+
+
+@app.route("/init", methods=["GET"])
+def init():
+    config = {
+        "startMode": "start",
+        "blStartX": 60,
+        "blStartY": 10,
+        "blStartZ": 27.23,
+        "rdStartX": 59,
+        "rdStartY": 10,
+        "rdStartZ": 280,
+        "trackingMode": True,
+        "detectMode": DETECT_MODE,
+        "logMode": False,
+        "stereoCameraMode": False,
+        "enemyTracking": False,
+        "saveSnapshot": False,
+        "saveLog": False,
+        "saveLidarData": False,
+        "lux": 30000,
+        "destoryObstaclesOnHit": True,
+    }
+    print("[/init]", config)
+    return jsonify(config)
+
+
+@app.route("/info", methods=["POST"])
+def info():
+    return jsonify({"status": "success", "control": ""})
+
+
+@app.route("/get_action", methods=["POST"])
+def get_action():
+    command = {
+        "moveWS": {"command": "", "weight": 0.0},
+        "moveAD": {"command": "", "weight": 0.0},
+        "turretQE": {"command": "", "weight": 0.0},
+        "turretRF": {"command": "", "weight": 0.0},
+        "fire": False,
+    }
+    return jsonify(command)
+
+# =========================
+# 웹 표시 API
+# =========================
+@app.route("/view")
+def view():
+    html = """
+    <!doctype html>
+    <html lang="ko">
+    <head>
+        <meta charset="utf-8">
+        <title>Live YOLO Detection View</title>
+        <style>
+            body { margin: 0; background: #111; color: #eee; font-family: Arial, sans-serif; text-align: center; }
+            header { padding: 12px 20px; background: #1e1e1e; border-bottom: 1px solid #333; }
+            .wrap { padding: 16px; }
+            img { max-width: 96vw; max-height: 82vh; border: 2px solid #00ff00; background: #000; }
+            .hint { margin-top: 10px; color: #aaa; font-size: 14px; }
+            a { color: #7dd3fc; }
+        </style>
+    </head>
+    <body>
+        <header><h2>Live YOLO Detection Result</h2></header>
+        <div class="wrap">
+            <img src="/video_feed" alt="YOLO stream">
+            <div class="hint">/detect로 들어온 원본 프레임은 즉시 표시하고, YOLO bbox는 백그라운드 결과를 덧그립니다.</div>
+            <div class="hint">상태 확인: <a href="/debug_state">/debug_state</a></div>
+        </div>
+    </body>
+    </html>
+    """
+    return render_template_string(html)
+
+
+def generate_video_stream():
+    interval = 1.0 / max(1.0, WEB_FPS)
+    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+
+    while True:
+        with state_lock:
+            frame = None if latest_frame is None else latest_frame.copy()
+            detections = list(latest_detections)
+
+        if frame is None:
+            frame = make_blank_frame()
+        else:
+            frame = draw_detections(frame, detections)
+
+        ok, buffer = cv2.imencode(".jpg", frame, encode_params)
+        if ok:
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
+            )
+        time.sleep(interval)
+
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(generate_video_stream(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.route("/debug_state")
+def debug_state():
+    with state_lock:
+        result_age = time.time() - latest_result_timestamp if latest_result_timestamp else None
+        frame_age = time.time() - latest_frame_timestamp if latest_frame_timestamp else None
+        payload = {
+            "modelPath": str(YOLO_MODEL_PATH),
+            "modelNames": model_names,
+            "device": YOLO_DEVICE,
+            "cudaAvailable": torch.cuda.is_available(),
+            "half": YOLO_HALF,
+            "imgsz": YOLO_IMGSZ,
+            "conf": YOLO_CONF,
+            "latestFrameSeq": latest_frame_seq,
+            "processedFrameSeq": processed_frame_seq,
+            "requestCount": request_count,
+            "workerCount": worker_count,
+            "latestDetectionCount": len(latest_detections),
+            "latestDetections": latest_detections,
+            "latestDetectResponseMs": latest_detect_response_ms,
+            "latestDecodeMs": latest_decode_ms,
+            "latestYoloMs": latest_yolo_ms,
+            "latestPostMs": latest_post_ms,
+            "latestWorkerTotalMs": latest_worker_total_ms,
+            "latestFrameShape": latest_frame_shape,
+            "latestFrameAgeMs": None if frame_age is None else frame_age * 1000,
+            "latestResultAgeMs": None if result_age is None else result_age * 1000,
+            "latestError": latest_error,
+            "webFps": WEB_FPS,
+            "jpegQuality": JPEG_QUALITY,
+        }
+    return jsonify(payload)
+
+# =========================
+# Warm-up
+# =========================
+def warmup_yolo() -> None:
+    if not YOLO_MODEL_PATH.exists():
+        return
+    dummy = np.zeros((YOLO_IMGSZ, YOLO_IMGSZ, 3), dtype=np.uint8)
+    started = time.perf_counter()
+    try:
+        for _ in range(3):
+            with torch.inference_mode():
+                model.predict(
+                    source=dummy,
+                    conf=YOLO_CONF,
+                    imgsz=YOLO_IMGSZ,
+                    device=YOLO_DEVICE,
+                    half=YOLO_HALF,
+                    iou=YOLO_IOU,
+                    max_det=YOLO_MAX_DET,
+                    verbose=False,
+                )
+        if USE_CUDA:
+            torch.cuda.synchronize()
+        print(f"YOLO warm-up complete: {(time.perf_counter() - started) * 1000:.1f} ms")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warmup:error] {exc}")
+
+
+if __name__ == "__main__":
+    warmup_yolo()
+    Thread(target=yolo_worker_loop, daemon=True).start()
+    print(f"Server running: http://127.0.0.1:{PORT}/view")
+    app.run(host=HOST, port=PORT, threaded=True)
