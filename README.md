@@ -87,7 +87,6 @@ python scripts/run_yolo_server.py
 - `YOLO_WALL_CONF=0.15`
 - `YOLO_MAX_DET=20`
 - `YOLO_MAX_RETURN=5`
-- `YOLO_SHADOW_FILTER=false`
 - `YOLO_DETECT_CACHE=true`
 - `YOLO_MIN_INTERVAL=0.12`
 - `YOLO_LOW_CONF_FALLBACK=false`
@@ -108,7 +107,6 @@ $env:YOLO_DEFAULT_CONF="0.20"
 $env:YOLO_WALL_CONF="0.15"
 $env:YOLO_MAX_DET="20"
 $env:YOLO_MAX_RETURN="5"
-$env:YOLO_SHADOW_FILTER="false"
 $env:YOLO_DETECT_CACHE="true"
 $env:YOLO_MIN_INTERVAL="0.12"
 $env:YOLO_LOW_CONF_FALLBACK="false"
