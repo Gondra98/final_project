@@ -5,7 +5,6 @@ Tank simulator API server and YOLO perception utilities.
 ## Project Layout
 
 - `configs/`: simulator connection settings
-- `docs/`: project and API notes
 - `scripts/run_yolo_server.py`: Flask server with YOLO detection
 - `scripts/run_simulator_client.py`: simulator client entrypoint
 - `scripts/train_yolo_wall_detector.py`: Roboflow dataset merge and YOLO fine-tuning script
