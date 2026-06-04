@@ -828,15 +828,6 @@ def stereo_image():
     if not left_image or not right_image:
         return jsonify({"result": "error", "message": "Left or Right image missing"}), 400
 
-    left_path = "temp_left.jpg"
-    right_path = "temp_right.jpg"
-
-    try:
-        left_image.save(left_path)
-        right_image.save(right_path)
-    except Exception as e:
-        return jsonify({"result": "error", "message": str(e)}), 500
-
     return jsonify({"result": "success"})
     
 @app.route('/info', methods=['POST'])
