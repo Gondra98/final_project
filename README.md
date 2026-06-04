@@ -1,10 +1,10 @@
 # TankSimulation
 
-Tank simulator API server and YOLO perception utilities.
+Tank 시뮬레이터 API 서버와 YOLO 인식 유틸리티입니다.
 
-## Team Quick Start
+## 팀원 빠른 시작
 
-Use this when another teammate wants to run this branch from a fresh clone.
+팀원이 새로 클론한 상태에서 이 브랜치를 실행하려면 아래 순서대로 진행하면 됩니다.
 
 ```powershell
 git clone https://github.com/RT-FINAL-2TEAM/TankSimulation.git
@@ -15,7 +15,7 @@ git fetch evann
 git checkout -b fix/yolo evann/fix/yolo
 ```
 
-Create and activate a virtual environment:
+가상환경을 만들고 활성화합니다:
 
 ```powershell
 python -m venv .venv
@@ -23,15 +23,15 @@ python -m venv .venv
 python -m pip install --upgrade pip
 ```
 
-Install dependencies:
+필요한 패키지를 설치합니다:
 
 ```powershell
 pip install -r requirements.txt
 pip install -r requirements-torch-cu128.txt
 ```
 
-Model weights are not committed to Git. Share the trained `best.pt` file with
-teammates separately, then place it at one of these paths:
+모델 가중치는 Git에 커밋하지 않습니다. 학습된 `best.pt` 파일은 팀원에게 따로 공유한 뒤,
+아래 경로 중 하나에 넣어 주세요:
 
 ```text
 runs/detect/finetune_tankkk2_valfix_30/weights/best.pt
@@ -39,47 +39,47 @@ runs/detect/finetune_tankkk2-2/weights/best.pt
 runs/detect/first_yolo11n/weights/best.pt
 ```
 
-Or set the model path explicitly before running:
+또는 실행 전에 모델 경로를 직접 지정할 수 있습니다:
 
 ```powershell
 $env:YOLO_MODEL_PATH="runs/detect/finetune_tankkk2_valfix_30/weights/best.pt"
 python scripts/run_yolo_server.py
 ```
 
-Check that the server is running:
+서버가 정상 실행 중인지 확인합니다:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:5000/debug_state
 ```
 
-The server binds to `0.0.0.0:5000` by default. If the simulator runs on another
-machine, connect it to the server PC's IP address on port `5000`.
+서버는 기본적으로 `0.0.0.0:5000`에 바인딩됩니다. 시뮬레이터가 다른 PC에서 실행된다면,
+서버를 실행한 PC의 IP 주소와 `5000` 포트로 연결하면 됩니다.
 
-## Project Layout
+## 프로젝트 구조
 
-- `configs/`: simulator connection settings
-- `scripts/run_yolo_server.py`: Flask server with YOLO detection
-- `scripts/run_simulator_client.py`: simulator client entrypoint
-- `scripts/train_yolo_wall_detector.py`: Roboflow dataset merge and YOLO fine-tuning script
-- `src/`: reusable simulator, perception, planning, and RL modules
-- `tests/`: automated tests
+- `configs/`: 시뮬레이터 연결 설정
+- `scripts/run_yolo_server.py`: YOLO 탐지를 포함한 Flask 서버
+- `scripts/run_simulator_client.py`: 시뮬레이터 클라이언트 실행 진입점
+- `scripts/train_yolo_wall_detector.py`: Roboflow 데이터셋 병합 및 YOLO 파인튜닝 스크립트
+- `src/`: 재사용 가능한 시뮬레이터, 인식, 경로 계획, RL 모듈
+- `tests/`: 자동화 테스트
 
-Generated datasets, training runs, model weights, caches, and editor files are intentionally ignored by Git.
+생성된 데이터셋, 학습 결과, 모델 가중치, 캐시, 에디터 파일은 Git에 올라가지 않도록 제외되어 있습니다.
 
-## Setup
+## 설치
 
 ```bash
 pip install -r requirements.txt
 pip install -r requirements-torch-cu128.txt
 ```
 
-## Run The YOLO Server
+## YOLO 서버 실행
 
 ```bash
 python scripts/run_yolo_server.py
 ```
 
-Default runtime behavior is tuned for YOLO-only demo detection:
+기본 실행 설정은 YOLO 단독 데모 탐지에 맞춰져 있습니다:
 
 - `YOLO_IMGSZ=512`
 - `YOLO_MODEL_CONF=0.10`
@@ -98,7 +98,7 @@ Default runtime behavior is tuned for YOLO-only demo detection:
 - `SIM_DETECT_MODE=true`
 - `FLASK_THREADED=false`
 
-Demo runtime flags on Windows PowerShell:
+Windows PowerShell에서 데모용 실행 옵션:
 
 ```powershell
 $env:YOLO_MODEL_PATH="runs/detect/finetune_tankkk2_valfix_30/weights/best.pt"
@@ -120,20 +120,20 @@ $env:FLASK_THREADED="false"
 python scripts/run_yolo_server.py
 ```
 
-For a faster accuracy tradeoff test:
+더 빠른 대신 정확도는 낮아질 수 있는 테스트:
 
 ```powershell
 $env:YOLO_IMGSZ="416"
 python scripts/run_yolo_server.py
 ```
 
-Debug the active server state:
+현재 서버 상태를 확인합니다:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:5000/debug_state
 ```
 
-Recognition logs print to the console when final `/detect` results contain objects:
+최종 `/detect` 결과에 객체가 포함되면 콘솔에 인식 로그가 출력됩니다:
 
 ```text
 [detect] 2 object(s) recognized
@@ -141,28 +141,28 @@ Recognition logs print to the console when final `/detect` results contain objec
 [detect] class=tank conf=0.81 bbox=[500.1, 320.4, 700.5, 480.2]
 ```
 
-If logs are too noisy:
+로그가 너무 많이 출력된다면:
 
 ```powershell
 $env:YOLO_RECOGNITION_LOG="false"
 python scripts/run_yolo_server.py
 ```
 
-To include cached detection responses in recognition logs:
+캐시된 탐지 응답도 인식 로그에 포함하려면:
 
 ```powershell
 $env:YOLO_RECOGNITION_LOG_CACHE="true"
 python scripts/run_yolo_server.py
 ```
 
-To log empty detection results:
+탐지 결과가 비어 있는 경우도 로그로 남기려면:
 
 ```powershell
 $env:YOLO_RECOGNITION_LOG_EMPTY="true"
 python scripts/run_yolo_server.py
 ```
 
-Debug runtime flags are heavier but better for finding detection failures. `YOLO_LOW_CONF_FALLBACK=true` can run a second YOLO pass on empty results, so keep it off for demos unless you are diagnosing a problem.
+디버그용 실행 옵션은 더 무겁지만 탐지 실패 원인을 찾을 때 유용합니다. `YOLO_LOW_CONF_FALLBACK=true`는 결과가 비어 있을 때 YOLO를 한 번 더 실행할 수 있으므로, 문제를 진단하는 상황이 아니라면 데모에서는 꺼두는 편이 좋습니다.
 
 ```powershell
 $env:YOLO_MODEL_PATH="runs/detect/finetune_tankkk2_valfix_30/weights/best.pt"
@@ -180,7 +180,7 @@ $env:FLASK_THREADED="false"
 python scripts/run_yolo_server.py
 ```
 
-For a full filter-bypass pass, add:
+반환 필터를 완전히 우회하려면 다음 옵션도 추가합니다:
 
 ```powershell
 $env:YOLO_BYPASS_RETURN_FILTER="true"
@@ -189,33 +189,33 @@ $env:YOLO_DEFAULT_CONF="0.05"
 $env:YOLO_WALL_CONF="0.05"
 ```
 
-Use `/debug_state` to separate failure causes:
+`/debug_state`로 실패 원인을 나눠서 확인할 수 있습니다:
 
-- `modelPath`: confirms which `best.pt` was loaded
-- `modelNames` and `publicNames`: confirm model class IDs map to returned `className` values
-- `recognitionLogEnabled`: confirms console recognition logging is enabled
-- `latestRawDetectionCount=0`: model path, model quality, or input image issue
-- `latestRawDetectionCount>0` and `latestReturnedDetectionCount=0`: return threshold/filter issue
-- `latestDetectCached=true`: cached result was returned; check `latestCacheReason`
-- `modelPathFromEnv=false`: server used auto-selected weights, not `YOLO_MODEL_PATH`
-- `latestFrameShape`, `latestFrameMean`, `latestFrameStd`: confirms the simulator image is being decoded
-- `latestRejectedDetections`: shows per-box filter reasons such as `below_default_threshold`
-- `latestFallbackUsed=true`: the normal confidence pass found nothing and the low-confidence fallback produced the latest result
+- `modelPath`: 어떤 `best.pt`가 로드되었는지 확인
+- `modelNames`와 `publicNames`: 모델 클래스 ID가 반환되는 `className` 값과 어떻게 매핑되는지 확인
+- `recognitionLogEnabled`: 콘솔 인식 로그가 켜져 있는지 확인
+- `latestRawDetectionCount=0`: 모델 경로, 모델 품질, 입력 이미지 문제 가능성
+- `latestRawDetectionCount>0`와 `latestReturnedDetectionCount=0`: 반환 임계값 또는 필터 문제 가능성
+- `latestDetectCached=true`: 캐시된 결과가 반환된 상태이므로 `latestCacheReason` 확인
+- `modelPathFromEnv=false`: 서버가 `YOLO_MODEL_PATH`가 아니라 자동 선택된 가중치를 사용한 상태
+- `latestFrameShape`, `latestFrameMean`, `latestFrameStd`: 시뮬레이터 이미지가 정상 디코딩되는지 확인
+- `latestRejectedDetections`: `below_default_threshold` 같은 박스별 필터 제외 이유 확인
+- `latestFallbackUsed=true`: 일반 confidence 탐지에서는 결과가 없었고 low-confidence fallback이 최신 결과를 만든 상태
 
-## Train Or Fine-Tune YOLO
+## YOLO 학습 또는 파인튜닝
 
-Set the Roboflow API key before downloading datasets:
+데이터셋을 다운로드하기 전에 Roboflow API 키를 설정합니다:
 
 ```bash
 export ROBOFLOW_API_KEY=your_key_here
 python scripts/train_yolo_wall_detector.py
 ```
 
-On Windows PowerShell:
+Windows PowerShell에서는 다음처럼 설정합니다:
 
 ```powershell
 $env:ROBOFLOW_API_KEY="your_key_here"
 python scripts/train_yolo_wall_detector.py
 ```
 
-Do not commit model weights or downloaded datasets. Use Git LFS or a release artifact if the team needs to share trained weights.
+모델 가중치나 다운로드한 데이터셋은 커밋하지 마세요. 팀에서 학습된 가중치를 공유해야 한다면 Git LFS나 릴리스 아티팩트를 사용하세요.
