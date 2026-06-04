@@ -2,6 +2,59 @@
 
 Tank simulator API server and YOLO perception utilities.
 
+## Team Quick Start
+
+Use this when another teammate wants to run this branch from a fresh clone.
+
+```powershell
+git clone https://github.com/RT-FINAL-2TEAM/TankSimulation.git
+cd TankSimulation
+
+git remote add evann https://github.com/Evann9/TankSimulation-yolo.git
+git fetch evann
+git checkout -b fix/yolo evann/fix/yolo
+```
+
+Create and activate a virtual environment:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+```
+
+Install dependencies:
+
+```powershell
+pip install -r requirements.txt
+pip install -r requirements-torch-cu128.txt
+```
+
+Model weights are not committed to Git. Share the trained `best.pt` file with
+teammates separately, then place it at one of these paths:
+
+```text
+runs/detect/finetune_tankkk2_valfix_30/weights/best.pt
+runs/detect/finetune_tankkk2-2/weights/best.pt
+runs/detect/first_yolo11n/weights/best.pt
+```
+
+Or set the model path explicitly before running:
+
+```powershell
+$env:YOLO_MODEL_PATH="runs/detect/finetune_tankkk2_valfix_30/weights/best.pt"
+python scripts/run_yolo_server.py
+```
+
+Check that the server is running:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:5000/debug_state
+```
+
+The server binds to `0.0.0.0:5000` by default. If the simulator runs on another
+machine, connect it to the server PC's IP address on port `5000`.
+
 ## Project Layout
 
 - `configs/`: simulator connection settings
