@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import os
 from pathlib import Path
+from threading import Lock
 import time
 
 import cv2
@@ -17,24 +18,36 @@ FINETUNED_MODEL_PATHS = [
     PROJECT_ROOT / "runs" / "detect" / "finetune_tankkk2_focus_150" / "weights" / "best.pt",
     PROJECT_ROOT / "runs" / "detect" / "finetune_tankkk2_focus_continue_150" / "weights" / "best.pt",
     PROJECT_ROOT / "runs" / "detect" / "finetune_tankkk2_valfix_30" / "weights" / "best.pt",
+    PROJECT_ROOT / "runs" / "detect" / "finetune_tankkk2-2" / "weights" / "best.pt",
     PROJECT_ROOT / "runs" / "detect" / "finetune_tankkk2" / "weights" / "best.pt",
 ]
 CLASS_ALIASES = {
     "blue": "person",
     "red": "person",
-    "tank": "Tank",
+    "tank": "tank",
 }
 IGNORED_CLASSES = {"car"}
-MODEL_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_MODEL_CONF", "0.04"))
+CLASS_COLORS = {
+    "person": "#00FFFF",
+    "rock": "#FFA500",
+    "tank": "#FF0000",
+    "wall": "#00FF00",
+    "tent": "#FFFF00",
+}
+DEFAULT_BOX_COLOR = "#00FF00"
+MODEL_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_MODEL_CONF", "0.10"))
+FALLBACK_MODEL_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_FALLBACK_MODEL_CONF", "0.05"))
 DEFAULT_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_DEFAULT_CONF", "0.20"))
 CLASS_CONFIDENCE_THRESHOLDS = {
-    "wall": float(os.getenv("YOLO_WALL_CONF", "0.06")),
+    "wall": float(os.getenv("YOLO_WALL_CONF", "0.15")),
 }
-CLOSE_WALL_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_CLOSE_WALL_CONF", "0.04"))
+CLOSE_WALL_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_CLOSE_WALL_CONF", "0.12"))
 CLOSE_WALL_AREA_RATIO = float(os.getenv("YOLO_CLOSE_WALL_AREA_RATIO", "0.08"))
 CLOSE_WALL_MIN_HEIGHT_RATIO = float(os.getenv("YOLO_CLOSE_WALL_MIN_HEIGHT_RATIO", "0.35"))
 YOLO_IOU = float(os.getenv("YOLO_IOU", "0.70"))
-YOLO_MAX_DET = int(os.getenv("YOLO_MAX_DET", "100"))
+YOLO_MAX_DET = int(os.getenv("YOLO_MAX_DET", "20"))
+MAX_RETURN_DETECTIONS = int(os.getenv("YOLO_MAX_RETURN", "5"))
+DEBUG_DETECTION_LIMIT = int(os.getenv("YOLO_DEBUG_DET_LIMIT", "10"))
 
 
 def env_flag(name, default=False):
@@ -46,18 +59,29 @@ def env_flag(name, default=False):
 
 YOLO_DEVICE = os.getenv("YOLO_DEVICE", "0" if torch.cuda.is_available() else "cpu")
 USE_CUDA_DEVICE = torch.cuda.is_available() and YOLO_DEVICE.lower() != "cpu"
-YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "640"))
+YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "512"))
 YOLO_HALF = USE_CUDA_DEVICE and env_flag("YOLO_HALF", True)
-YOLO_TIMING = env_flag("YOLO_TIMING", False)
+YOLO_TIMING = env_flag("YOLO_TIMING", env_flag("DEBUG_PERF_LOG", False))
 YOLO_DETECT_DEBUG = env_flag("YOLO_DETECT_DEBUG", False)
+YOLO_RECOGNITION_LOG = env_flag("YOLO_RECOGNITION_LOG", True)
+YOLO_RECOGNITION_LOG_CACHE = env_flag("YOLO_RECOGNITION_LOG_CACHE", False)
+YOLO_RECOGNITION_LOG_EMPTY = env_flag("YOLO_RECOGNITION_LOG_EMPTY", False)
 YOLO_WARMUP_RUNS = int(os.getenv("YOLO_WARMUP_RUNS", "2"))
-SHADOW_FILTER_ENABLED = env_flag("YOLO_SHADOW_FILTER", True)
+SHADOW_FILTER_ENABLED = env_flag("YOLO_SHADOW_FILTER", False)
 SHADOW_FILTER_SIGMA = float(os.getenv("YOLO_SHADOW_SIGMA", "35.0"))
 SHADOW_FILTER_STRENGTH = float(os.getenv("YOLO_SHADOW_STRENGTH", "0.75"))
 SHADOW_FILTER_WORK_SCALE = float(os.getenv("YOLO_SHADOW_WORK_SCALE", "0.35"))
 SHADOW_FILTER_MAX_SIDE = int(os.getenv("YOLO_SHADOW_MAX_SIDE", "960"))
 SHADOW_FILTER_CLAHE = env_flag("YOLO_SHADOW_CLAHE", False)
 SHADOW_FILTER_CLAHE_CLIP = float(os.getenv("YOLO_SHADOW_CLAHE_CLIP", "1.5"))
+ENABLE_DETECT_CACHE = env_flag("YOLO_DETECT_CACHE", True)
+YOLO_MIN_INTERVAL = float(os.getenv("YOLO_MIN_INTERVAL", "0.12"))
+YOLO_BYPASS_RETURN_FILTER = env_flag("YOLO_BYPASS_RETURN_FILTER", False)
+YOLO_LOW_CONF_FALLBACK = env_flag("YOLO_LOW_CONF_FALLBACK", False)
+YOLO_RETURN_FALLBACK_DETECTIONS = env_flag("YOLO_RETURN_FALLBACK_DETECTIONS", True)
+DETECT_MODE = env_flag("SIM_DETECT_MODE", True)
+SERVER_THREADED = env_flag("FLASK_THREADED", False)
+SERVER_MODE = "yolo_only_fast"
 
 if USE_CUDA_DEVICE:
     torch.backends.cudnn.benchmark = env_flag("YOLO_CUDNN_BENCHMARK", False)
@@ -74,11 +98,28 @@ def normalize_model_names(names):
     return {class_id: str(name) for class_id, name in enumerate(names)}
 
 
+def normalize_public_class_name(class_name):
+    class_name = str(class_name).strip().lower()
+    return CLASS_ALIASES.get(class_name, class_name)
+
+
+def get_box_color(class_name: str) -> str:
+    normalized = str(class_name).strip().lower()
+    return CLASS_COLORS.get(normalized, DEFAULT_BOX_COLOR)
+
+
 def get_public_class_name(class_id):
     class_name = model_names.get(class_id)
     if class_name is None:
         return None
-    return CLASS_ALIASES.get(class_name, class_name)
+    return normalize_public_class_name(class_name)
+
+
+def get_public_model_names():
+    return {
+        class_id: normalize_public_class_name(class_name)
+        for class_id, class_name in model_names.items()
+    }
 
 
 def get_box_size_ratios(box, frame_shape):
@@ -92,6 +133,13 @@ def get_box_size_ratios(box, frame_shape):
     return area_ratio, height_ratio
 
 
+def is_valid_box(box):
+    if len(box) < 4:
+        return False
+    x1, y1, x2, y2 = (float(value) for value in box[:4])
+    return x2 > x1 and y2 > y1
+
+
 def is_close_wall_candidate(class_name, confidence, box, frame_shape):
     if class_name != "wall" or confidence < CLOSE_WALL_CONFIDENCE_THRESHOLD:
         return False
@@ -99,13 +147,23 @@ def is_close_wall_candidate(class_name, confidence, box, frame_shape):
     return area_ratio >= CLOSE_WALL_AREA_RATIO or height_ratio >= CLOSE_WALL_MIN_HEIGHT_RATIO
 
 
-def should_return_detection(class_name, confidence, box, frame_shape):
+def evaluate_detection_for_return(class_name, confidence, box, frame_shape, bypass_return_filter):
+    if class_name is None:
+        return False, "class_name_none", None
+    if not is_valid_box(box):
+        return False, "invalid_box", None
     if class_name in IGNORED_CLASSES:
-        return False
+        return False, "ignored_class", None
+    if bypass_return_filter:
+        return True, None, None
     if is_close_wall_candidate(class_name, confidence, box, frame_shape):
-        return True
+        return True, None, CLOSE_WALL_CONFIDENCE_THRESHOLD
     threshold = CLASS_CONFIDENCE_THRESHOLDS.get(class_name, DEFAULT_CONFIDENCE_THRESHOLD)
-    return confidence >= threshold
+    if confidence >= threshold:
+        return True, None, threshold
+    if class_name in CLASS_CONFIDENCE_THRESHOLDS:
+        return False, "below_class_threshold", threshold
+    return False, "below_default_threshold", threshold
 
 
 def decode_uploaded_image(image):
@@ -204,36 +262,74 @@ def scale_box_to_original_frame(box, scale_x, scale_y):
 
 
 def make_warmup_image():
-    sample_path = SCRIPT_DIR / "temp_image.jpg"
-    sample_image = cv2.imread(str(sample_path))
-    if sample_image is not None:
-        return sample_image
-
-    height = int(os.getenv("YOLO_WARMUP_HEIGHT", "1080"))
-    width = int(os.getenv("YOLO_WARMUP_WIDTH", "1920"))
-    return np.zeros((height, width, 3), dtype=np.uint8)
+    size = max(32, YOLO_IMGSZ)
+    return np.zeros((size, size, 3), dtype=np.uint8)
 
 
 def resolve_model_path():
-    env_model_path = os.getenv("YOLO_MODEL_PATH")
-    if env_model_path:
-        path = Path(env_model_path)
+    if YOLO_MODEL_PATH_ENV:
+        path = Path(YOLO_MODEL_PATH_ENV)
         return path if path.is_absolute() else PROJECT_ROOT / path
     for model_path in FINETUNED_MODEL_PATHS:
         if model_path.exists():
             return model_path
     return BASE_MODEL_PATH
 
+
+def get_model_path_candidates():
+    candidates = [*FINETUNED_MODEL_PATHS, BASE_MODEL_PATH]
+    return [
+        {
+            "path": str(path),
+            "exists": path.exists(),
+        }
+        for path in candidates
+    ]
+
 app = Flask(__name__)
+YOLO_MODEL_PATH_ENV = os.getenv("YOLO_MODEL_PATH")
+MODEL_PATH_FROM_ENV = bool(YOLO_MODEL_PATH_ENV)
 MODEL_PATH = resolve_model_path()
 model = YOLO(str(MODEL_PATH))
 model_names = normalize_model_names(model.names)
+public_names = get_public_model_names()
+detect_state_lock = Lock()
+yolo_predict_lock = Lock()
+detect_state = {
+    "latest_detections": [],
+    "latest_detection_timestamp": 0.0,
+    "latest_detect_cached": False,
+    "latest_detect_ms": 0.0,
+    "latest_decode_ms": 0.0,
+    "latest_preprocess_ms": 0.0,
+    "latest_yolo_ms": 0.0,
+    "latest_postprocess_ms": 0.0,
+    "latest_raw_detection_count": 0,
+    "latest_returned_detection_count": 0,
+    "latest_raw_detections": [],
+    "latest_returned_detections": [],
+    "latest_rejected_detections": [],
+    "latest_cache_reason": None,
+    "latest_frame_shape": None,
+    "latest_frame_mean": None,
+    "latest_frame_std": None,
+    "latest_model_conf_used": MODEL_CONFIDENCE_THRESHOLD,
+    "latest_fallback_used": False,
+}
+print(f"YOLO_MODEL_PATH env set: {MODEL_PATH_FROM_ENV}")
 print(f"Loaded YOLO model: {MODEL_PATH}")
 print(f"Model labels: {model_names}")
+print(f"Public labels: {public_names}")
 print(
     "YOLO runtime: "
     f"device={YOLO_DEVICE}, half={YOLO_HALF}, imgsz={YOLO_IMGSZ}, "
-    f"conf={MODEL_CONFIDENCE_THRESHOLD}, wall_conf={CLASS_CONFIDENCE_THRESHOLDS['wall']}, "
+    f"model_conf={MODEL_CONFIDENCE_THRESHOLD}, default_conf={DEFAULT_CONFIDENCE_THRESHOLD}, "
+    f"fallback_conf={FALLBACK_MODEL_CONFIDENCE_THRESHOLD}, low_conf_fallback={YOLO_LOW_CONF_FALLBACK}, "
+    f"wall_conf={CLASS_CONFIDENCE_THRESHOLDS['wall']}, "
+    f"max_det={YOLO_MAX_DET}, max_return={MAX_RETURN_DETECTIONS}, "
+    f"cache={ENABLE_DETECT_CACHE}, min_interval={YOLO_MIN_INTERVAL}, "
+    f"bypass_return_filter={YOLO_BYPASS_RETURN_FILTER}, "
+    f"flask_threaded={SERVER_THREADED}, "
     f"shadow_filter={SHADOW_FILTER_ENABLED}, shadow_sigma={SHADOW_FILTER_SIGMA}, "
     f"shadow_scale={SHADOW_FILTER_WORK_SCALE}, shadow_max_side={SHADOW_FILTER_MAX_SIDE}, "
     f"cudnn={torch.backends.cudnn.enabled}, "
@@ -258,6 +354,245 @@ if USE_CUDA_DEVICE:
     torch.cuda.synchronize()
     warmup_ms = (time.perf_counter() - warmup_started_at) * 1000
     print(f"YOLO CUDA warmup complete ({warmup_ms:.1f} ms, shape={warmup_image.shape})")
+print("YOLO server ready")
+
+
+def get_cuda_device_name():
+    if not torch.cuda.is_available():
+        return None
+    try:
+        device_index = 0 if YOLO_DEVICE.lower() == "cuda" else int(YOLO_DEVICE)
+    except ValueError:
+        device_index = 0
+    return torch.cuda.get_device_name(device_index)
+
+
+def get_cached_detections(now_seconds):
+    if not ENABLE_DETECT_CACHE:
+        return None
+    with detect_state_lock:
+        latest_timestamp = detect_state["latest_detection_timestamp"]
+        if latest_timestamp <= 0.0:
+            return None
+        if now_seconds - latest_timestamp > YOLO_MIN_INTERVAL:
+            return None
+        return list(detect_state["latest_detections"]), latest_timestamp
+
+
+def get_latest_detections():
+    with detect_state_lock:
+        latest_timestamp = detect_state["latest_detection_timestamp"]
+        if latest_timestamp <= 0.0:
+            return [], latest_timestamp
+        return list(detect_state["latest_detections"]), latest_timestamp
+
+
+def update_detect_state(
+    detections,
+    detection_timestamp,
+    detect_ms,
+    decode_ms,
+    preprocess_ms,
+    yolo_ms,
+    postprocess_ms,
+    raw_detection_count,
+    cached,
+    raw_detections=None,
+    rejected_detections=None,
+    cache_reason=None,
+    frame_shape=None,
+    frame_mean=None,
+    frame_std=None,
+    model_conf_used=None,
+    fallback_used=False,
+):
+    with detect_state_lock:
+        detect_state["latest_detections"] = list(detections)
+        detect_state["latest_detection_timestamp"] = detection_timestamp
+        detect_state["latest_detect_cached"] = cached
+        detect_state["latest_cache_reason"] = cache_reason
+        detect_state["latest_detect_ms"] = detect_ms
+        if not cached:
+            detect_state["latest_decode_ms"] = decode_ms
+            detect_state["latest_preprocess_ms"] = preprocess_ms
+            detect_state["latest_yolo_ms"] = yolo_ms
+            detect_state["latest_postprocess_ms"] = postprocess_ms
+            detect_state["latest_raw_detection_count"] = raw_detection_count
+            detect_state["latest_raw_detections"] = list(raw_detections or [])[:DEBUG_DETECTION_LIMIT]
+            detect_state["latest_rejected_detections"] = list(rejected_detections or [])[:DEBUG_DETECTION_LIMIT]
+            detect_state["latest_frame_shape"] = frame_shape
+            detect_state["latest_frame_mean"] = frame_mean
+            detect_state["latest_frame_std"] = frame_std
+            detect_state["latest_model_conf_used"] = model_conf_used
+            detect_state["latest_fallback_used"] = fallback_used
+        detect_state["latest_returned_detection_count"] = len(detections)
+        detect_state["latest_returned_detections"] = list(detections)[:DEBUG_DETECTION_LIMIT]
+
+
+def log_detect_perf(
+    decode_ms,
+    preprocess_ms,
+    yolo_ms,
+    postprocess_ms,
+    total_ms,
+    raw_detection_count,
+    returned_detection_count,
+    cached,
+):
+    if not YOLO_TIMING:
+        return
+    print(
+        "[perf:/detect] "
+        f"decode={decode_ms:.1f}ms "
+        f"preprocess={preprocess_ms:.1f}ms "
+        f"yolo={yolo_ms:.1f}ms "
+        f"post={postprocess_ms:.1f}ms "
+        f"total={total_ms:.1f}ms "
+        f"raw={raw_detection_count} "
+        f"returned={returned_detection_count} "
+        f"cached={cached}"
+    )
+
+
+def return_cached_response(started_at, detections, detection_timestamp, reason):
+    elapsed_ms = (time.perf_counter() - started_at) * 1000
+    update_detect_state(
+        detections,
+        detection_timestamp,
+        elapsed_ms,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0,
+        True,
+        cache_reason=reason,
+    )
+    if YOLO_TIMING:
+        print(f"[perf:/detect] cached response reason={reason}")
+    log_detect_perf(0.0, 0.0, 0.0, 0.0, elapsed_ms, 0, len(detections), True)
+    log_recognized_detections(detections, cached=True)
+    return jsonify(detections)
+
+
+def log_recognized_detections(detections, cached=False):
+    if not YOLO_RECOGNITION_LOG:
+        return
+    if cached and not YOLO_RECOGNITION_LOG_CACHE:
+        return
+    if not detections:
+        if YOLO_RECOGNITION_LOG_EMPTY:
+            print("[detect] no object recognized")
+        return
+
+    print(f"[detect] {len(detections)} object(s) recognized")
+    for detection in detections:
+        bbox = detection.get("bbox", [])
+        bbox_text = ", ".join(f"{float(coord):.1f}" for coord in bbox[:4])
+        print(
+            f"[detect] class={detection.get('className')} "
+            f"conf={float(detection.get('confidence', 0.0)):.2f} "
+            f"bbox=[{bbox_text}]"
+        )
+
+
+def make_detection_response(class_name, box, confidence):
+    return {
+        "className": class_name,
+        "bbox": [float(coord) for coord in box[:4]],
+        "confidence": confidence,
+        "color": get_box_color(class_name),
+        "filled": False,
+        "updateBoxWhileMoving": False,
+    }
+
+
+def make_debug_detection(
+    model_class_name,
+    class_name,
+    box,
+    confidence,
+    returned,
+    reject_reason,
+    threshold,
+):
+    item = {
+        "modelClassName": model_class_name,
+        "className": class_name,
+        "bbox": [float(coord) for coord in box[:4]],
+        "confidence": confidence,
+        "returned": returned,
+        "rejectReason": reject_reason,
+        "threshold": threshold,
+    }
+    return item
+
+
+def result_box_count(results):
+    if not results:
+        return 0
+    boxes = results[0].boxes
+    if boxes is None:
+        return 0
+    return len(boxes)
+
+
+def get_debug_state_payload():
+    with detect_state_lock:
+        state = dict(detect_state)
+    return {
+        "serverMode": SERVER_MODE,
+        "modelPath": str(MODEL_PATH),
+        "modelPathFromEnv": MODEL_PATH_FROM_ENV,
+        "modelPathEnvValue": YOLO_MODEL_PATH_ENV,
+        "modelPathCandidates": get_model_path_candidates(),
+        "modelNames": model_names,
+        "publicNames": public_names,
+        "yoloImgsz": YOLO_IMGSZ,
+        "modelConf": MODEL_CONFIDENCE_THRESHOLD,
+        "fallbackModelConf": FALLBACK_MODEL_CONFIDENCE_THRESHOLD,
+        "lowConfFallbackEnabled": YOLO_LOW_CONF_FALLBACK,
+        "returnFallbackDetections": YOLO_RETURN_FALLBACK_DETECTIONS,
+        "defaultConf": DEFAULT_CONFIDENCE_THRESHOLD,
+        "classThresholds": CLASS_CONFIDENCE_THRESHOLDS,
+        "closeWallConf": CLOSE_WALL_CONFIDENCE_THRESHOLD,
+        "ignoredClasses": sorted(IGNORED_CLASSES),
+        "classColors": CLASS_COLORS,
+        "defaultBoxColor": DEFAULT_BOX_COLOR,
+        "recognitionLogEnabled": YOLO_RECOGNITION_LOG,
+        "recognitionLogCacheEnabled": YOLO_RECOGNITION_LOG_CACHE,
+        "recognitionLogEmptyEnabled": YOLO_RECOGNITION_LOG_EMPTY,
+        "bypassReturnFilter": YOLO_BYPASS_RETURN_FILTER,
+        "yoloIou": YOLO_IOU,
+        "yoloMaxDet": YOLO_MAX_DET,
+        "maxReturnDetections": MAX_RETURN_DETECTIONS,
+        "debugDetectionLimit": DEBUG_DETECTION_LIMIT,
+        "shadowFilterEnabled": SHADOW_FILTER_ENABLED,
+        "detectCacheEnabled": ENABLE_DETECT_CACHE,
+        "yoloMinInterval": YOLO_MIN_INTERVAL,
+        "detectMode": DETECT_MODE,
+        "flaskThreaded": SERVER_THREADED,
+        "latestCacheReason": state["latest_cache_reason"],
+        "latestDetectMs": state["latest_detect_ms"],
+        "latestDecodeMs": state["latest_decode_ms"],
+        "latestYoloMs": state["latest_yolo_ms"],
+        "latestPreprocessMs": state["latest_preprocess_ms"],
+        "latestPostprocessMs": state["latest_postprocess_ms"],
+        "latestRawDetectionCount": state["latest_raw_detection_count"],
+        "latestReturnedDetectionCount": state["latest_returned_detection_count"],
+        "latestRawDetections": state["latest_raw_detections"],
+        "latestReturnedDetections": state["latest_returned_detections"],
+        "latestRejectedDetections": state["latest_rejected_detections"],
+        "latestFrameShape": state["latest_frame_shape"],
+        "latestFrameMean": state["latest_frame_mean"],
+        "latestFrameStd": state["latest_frame_std"],
+        "latestModelConfUsed": state["latest_model_conf_used"],
+        "latestFallbackUsed": state["latest_fallback_used"],
+        "latestDetectCached": state["latest_detect_cached"],
+        "cudaAvailable": torch.cuda.is_available(),
+        "cudaDeviceName": get_cuda_device_name(),
+    }
+# Fire/destruction is deferred; the current server only exercises movement and perception.
 combined_commands = [
     {
         "moveWS": {"command": "W", "weight": 1.0},
@@ -271,7 +606,7 @@ combined_commands = [
         "moveAD": {"command": "A", "weight": 0.4},
         "turretQE": {"command": "E", "weight": 0.8},
         "turretRF": {"command": "R", "weight": 0.3},
-        "fire": True
+        "fire": False
     },
     {
         "moveWS": {"command": "W", "weight": 0.5},
@@ -285,7 +620,7 @@ combined_commands = [
         "moveAD": {"command": "D", "weight": 0.3},
         "turretQE": {"command": "E", "weight": 0.5},
         "turretRF": {"command": "R", "weight": 0.7},
-        "fire": True
+        "fire": False
     },
     {
         "moveWS": {"command": "W", "weight": 1.0},
@@ -299,14 +634,14 @@ combined_commands = [
         "moveAD": {"command": "A", "weight": 0.6},
         "turretQE": {"command": "E", "weight": 0.9},
         "turretRF": {"command": "R", "weight": 0.2},
-        "fire": True
+        "fire": False
     },
     {
         "moveWS": {"command": "W", "weight": 1.0},
         "moveAD": {"command": "D", "weight": 1.0},
         "turretQE": {"command": "E", "weight": 1.0},
         "turretRF": {"command": "R", "weight": 1.0},
-        "fire": True
+        "fire": False
     },
     {
         "moveWS": {"command": "W", "weight": 0.2},
@@ -320,7 +655,7 @@ combined_commands = [
         "moveAD": {"command": "D", "weight": 0.4},
         "turretQE": {"command": "E", "weight": 0.6},
         "turretRF": {"command": "F", "weight": 0.6},
-        "fire": True
+        "fire": False
     },
     {
         "moveWS": {"command": "W", "weight": 0.8},
@@ -334,7 +669,7 @@ combined_commands = [
         "moveAD": {"command": "", "weight": 0.0},
         "turretQE": {"command": "", "weight": 0.0},
         "turretRF": {"command": "", "weight": 0.0},
-        "fire": True
+        "fire": False
     },
     {
         "moveWS": {"command": "S", "weight": 0.2},
@@ -348,66 +683,157 @@ combined_commands = [
 
 @app.route('/detect', methods=['POST'])
 def detect():
+    started_at = time.perf_counter()
     image = request.files.get('image')
     if not image:
         return jsonify({"error": "No image received"}), 400
 
-    frame = decode_uploaded_image(image)
-    if frame is None:
-        return jsonify({"error": "Invalid image received"}), 400
+    cached = get_cached_detections(time.time())
+    if cached is not None:
+        cached_results, cached_timestamp = cached
+        return return_cached_response(started_at, cached_results, cached_timestamp, "fresh_interval")
 
-    original_shape = frame.shape
-    started_at = time.perf_counter()
-    preprocess_started_at = time.perf_counter()
-    frame, scale_x, scale_y = preprocess_frame_for_detection(frame)
-    preprocess_ms = (time.perf_counter() - preprocess_started_at) * 1000
-    with torch.inference_mode():
-        results = model.predict(
-            source=frame,
-            conf=MODEL_CONFIDENCE_THRESHOLD,
-            imgsz=YOLO_IMGSZ,
-            device=YOLO_DEVICE,
-            half=YOLO_HALF,
-            iou=YOLO_IOU,
-            max_det=YOLO_MAX_DET,
-            verbose=False,
-        )
+    if not yolo_predict_lock.acquire(blocking=False):
+        latest_results, latest_timestamp = get_latest_detections()
+        return return_cached_response(started_at, latest_results, latest_timestamp, "inference_busy")
 
+    try:
+        decode_started_at = time.perf_counter()
+        frame = decode_uploaded_image(image)
+        decode_ms = (time.perf_counter() - decode_started_at) * 1000
+        if frame is None:
+            return jsonify({"error": "Invalid image received"}), 400
+
+        original_shape = frame.shape
+        frame_shape = [int(value) for value in original_shape]
+        frame_mean = float(np.mean(frame))
+        frame_std = float(np.std(frame))
+        preprocess_started_at = time.perf_counter()
+        frame, scale_x, scale_y = preprocess_frame_for_detection(frame)
+        preprocess_ms = (time.perf_counter() - preprocess_started_at) * 1000
+
+        yolo_started_at = time.perf_counter()
+        model_conf_used = MODEL_CONFIDENCE_THRESHOLD
+        fallback_used = False
+        with torch.inference_mode():
+            results = model.predict(
+                source=frame,
+                conf=MODEL_CONFIDENCE_THRESHOLD,
+                imgsz=YOLO_IMGSZ,
+                device=YOLO_DEVICE,
+                half=YOLO_HALF,
+                iou=YOLO_IOU,
+                max_det=YOLO_MAX_DET,
+                verbose=False,
+            )
+            if (
+                YOLO_LOW_CONF_FALLBACK
+                and FALLBACK_MODEL_CONFIDENCE_THRESHOLD < MODEL_CONFIDENCE_THRESHOLD
+                and result_box_count(results) == 0
+            ):
+                fallback_used = True
+                model_conf_used = FALLBACK_MODEL_CONFIDENCE_THRESHOLD
+                results = model.predict(
+                    source=frame,
+                    conf=FALLBACK_MODEL_CONFIDENCE_THRESHOLD,
+                    imgsz=YOLO_IMGSZ,
+                    device=YOLO_DEVICE,
+                    half=YOLO_HALF,
+                    iou=YOLO_IOU,
+                    max_det=YOLO_MAX_DET,
+                    verbose=False,
+                )
+        yolo_ms = (time.perf_counter() - yolo_started_at) * 1000
+    finally:
+        yolo_predict_lock.release()
+
+    postprocess_started_at = time.perf_counter()
     boxes = results[0].boxes
     detections = boxes.data.detach().cpu().numpy() if boxes is not None else np.empty((0, 6))
     filtered_results = []
     raw_detections = []
+    rejected_detections = []
     for box in detections:
         class_id = int(box[5])
+        model_class_name = model_names.get(class_id)
         class_name = get_public_class_name(class_id)
-        if class_name is None:
-            continue
         confidence = float(box[4])
         scaled_box = scale_box_to_original_frame(box, scale_x, scale_y)
-        raw_detections.append(f"{class_name}:{confidence:.2f}")
-        if not should_return_detection(class_name, confidence, scaled_box, original_shape):
+        bypass_return_filter = YOLO_BYPASS_RETURN_FILTER or (
+            fallback_used and YOLO_RETURN_FALLBACK_DETECTIONS
+        )
+        returned, reject_reason, threshold = evaluate_detection_for_return(
+            class_name,
+            confidence,
+            scaled_box,
+            original_shape,
+            bypass_return_filter,
+        )
+        debug_detection = make_debug_detection(
+            model_class_name,
+            class_name,
+            scaled_box,
+            confidence,
+            returned,
+            reject_reason,
+            threshold,
+        )
+        raw_detections.append(debug_detection)
+        if not returned:
+            rejected_detections.append(debug_detection)
             continue
 
-        filtered_results.append({
-            'className': class_name,
-            'bbox': [float(coord) for coord in scaled_box[:4]],
-            'confidence': confidence,
-            'color': '#00FF00',
-            'filled': False,
-            'updateBoxWhileMoving': False
-        })
+        filtered_results.append(make_detection_response(class_name, scaled_box, confidence))
 
+    filtered_results.sort(key=lambda detection: detection["confidence"], reverse=True)
+    if not YOLO_BYPASS_RETURN_FILTER:
+        filtered_results = filtered_results[:MAX_RETURN_DETECTIONS]
+    postprocess_ms = (time.perf_counter() - postprocess_started_at) * 1000
+    elapsed_ms = (time.perf_counter() - started_at) * 1000
+    update_detect_state(
+        filtered_results,
+        time.time(),
+        elapsed_ms,
+        decode_ms,
+        preprocess_ms,
+        yolo_ms,
+        postprocess_ms,
+        len(raw_detections),
+        False,
+        raw_detections=raw_detections,
+        rejected_detections=rejected_detections,
+        frame_shape=frame_shape,
+        frame_mean=frame_mean,
+        frame_std=frame_std,
+        model_conf_used=model_conf_used,
+        fallback_used=fallback_used,
+    )
     if YOLO_DETECT_DEBUG:
-        print("Raw detections:", ", ".join(raw_detections) if raw_detections else "none")
-        print("Returned detections:", filtered_results)
-    if YOLO_TIMING:
-        elapsed_ms = (time.perf_counter() - started_at) * 1000
-        print(
-            f"YOLO detect: {elapsed_ms:.1f} ms, "
-            f"preprocess={preprocess_ms:.1f} ms, "
-            f"raw={len(raw_detections)}, returned={len(filtered_results)}"
+        raw_summary = ", ".join(
+            f"{item['className']}:{item['confidence']:.2f}:{item['rejectReason'] or 'returned'}"
+            for item in raw_detections
         )
+        print("Raw detections:", raw_summary if raw_summary else "none")
+        print("Returned detections:", filtered_results)
+    log_detect_perf(
+        decode_ms,
+        preprocess_ms,
+        yolo_ms,
+        postprocess_ms,
+        elapsed_ms,
+        len(raw_detections),
+        len(filtered_results),
+        False,
+    )
+    log_recognized_detections(filtered_results, cached=False)
     return jsonify(filtered_results)
+
+
+@app.route('/debug_state', methods=['GET'])
+@app.route('/debug/perf', methods=['GET'])
+def debug_state():
+    return jsonify(get_debug_state_payload())
+
 
 @app.route('/stereo_image', methods=['POST'])
 def stereo_image():
@@ -534,7 +960,7 @@ def init():
         "rdStartY": 10,
         "rdStartZ": 280,
         "trackingMode": True,
-        "detectMode": False,
+        "detectMode": DETECT_MODE,
         "logMode": False,
         "stereoCameraMode": False,
         "enemyTracking": False,
@@ -557,4 +983,4 @@ if __name__ == '__main__':
 
     host = config["simulator"]["host"]
     port = config["simulator"]["port"]
-    app.run(host=host, port=port, threaded=True)
+    app.run(host=host, port=port, threaded=SERVER_THREADED)

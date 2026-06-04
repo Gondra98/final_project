@@ -10,6 +10,7 @@ venv/
 # Runtime scratch files
 temp_*.jpg
 scripts/temp_*.jpg
+logs/
 
 # Model weights and training artifacts
 *.pt
