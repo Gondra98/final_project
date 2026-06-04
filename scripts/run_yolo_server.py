@@ -1,3 +1,14 @@
+"""
+Tank 시뮬레이터와 YOLO 모델을 연결하는 Flask 서버.
+
+큰 흐름:
+1. 환경변수와 `configs/simulator.yaml`에서 실행 설정을 읽는다.
+2. 사용할 YOLO `best.pt` 모델을 고르고 서버 시작 시 한 번 로드한다.
+3. 시뮬레이터가 `/detect`로 보낸 이미지를 YOLO로 추론한다.
+4. 탐지 결과를 시뮬레이터가 기대하는 JSON 형식으로 필터링해 반환한다.
+5. `/init`, `/get_action` 등 시뮬레이터 제어용 API도 같은 서버에서 처리한다.
+"""
+
 from flask import Flask, request, jsonify
 import os
 from pathlib import Path
@@ -10,6 +21,7 @@ import torch
 from ultralytics import YOLO
 import yaml
 
+# 프로젝트 경로, 모델 후보, 탐지 임계값 같은 전역 실행 설정입니다.
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 CONFIG_PATH = PROJECT_ROOT / "configs" / "simulator.yaml"
@@ -38,7 +50,7 @@ CLOSE_WALL_AREA_RATIO = float(os.getenv("YOLO_CLOSE_WALL_AREA_RATIO", "0.08"))
 CLOSE_WALL_MIN_HEIGHT_RATIO = float(os.getenv("YOLO_CLOSE_WALL_MIN_HEIGHT_RATIO", "0.35"))
 YOLO_IOU = float(os.getenv("YOLO_IOU", "0.70"))
 YOLO_MAX_DET = int(os.getenv("YOLO_MAX_DET", "20"))
-MAX_RETURN_DETECTIONS = int(os.getenv("YOLO_MAX_RETURN", "5"))
+MAX_RETURN_DETECTIONS = int(os.getenv("YOLO_MAX_RETURN", "30"))
 DEBUG_DETECTION_LIMIT = int(os.getenv("YOLO_DEBUG_DET_LIMIT", "10"))
 
 
@@ -59,13 +71,6 @@ YOLO_RECOGNITION_LOG = env_flag("YOLO_RECOGNITION_LOG", True)
 YOLO_RECOGNITION_LOG_CACHE = env_flag("YOLO_RECOGNITION_LOG_CACHE", False)
 YOLO_RECOGNITION_LOG_EMPTY = env_flag("YOLO_RECOGNITION_LOG_EMPTY", False)
 YOLO_WARMUP_RUNS = int(os.getenv("YOLO_WARMUP_RUNS", "2"))
-SHADOW_FILTER_ENABLED = env_flag("YOLO_SHADOW_FILTER", False)
-SHADOW_FILTER_SIGMA = float(os.getenv("YOLO_SHADOW_SIGMA", "35.0"))
-SHADOW_FILTER_STRENGTH = float(os.getenv("YOLO_SHADOW_STRENGTH", "0.75"))
-SHADOW_FILTER_WORK_SCALE = float(os.getenv("YOLO_SHADOW_WORK_SCALE", "0.35"))
-SHADOW_FILTER_MAX_SIDE = int(os.getenv("YOLO_SHADOW_MAX_SIDE", "960"))
-SHADOW_FILTER_CLAHE = env_flag("YOLO_SHADOW_CLAHE", False)
-SHADOW_FILTER_CLAHE_CLIP = float(os.getenv("YOLO_SHADOW_CLAHE_CLIP", "1.5"))
 ENABLE_DETECT_CACHE = env_flag("YOLO_DETECT_CACHE", True)
 YOLO_MIN_INTERVAL = float(os.getenv("YOLO_MIN_INTERVAL", "0.12"))
 YOLO_BYPASS_RETURN_FILTER = env_flag("YOLO_BYPASS_RETURN_FILTER", False)
@@ -79,6 +84,7 @@ if USE_CUDA_DEVICE:
     torch.backends.cudnn.benchmark = env_flag("YOLO_CUDNN_BENCHMARK", False)
 
 
+# 설정 로드, 라벨 정리, 박스 검증처럼 여러 단계에서 공유하는 유틸 함수들입니다.
 def load_config(path=CONFIG_PATH):
     with Path(path).open("r", encoding="utf-8") as f:
         return yaml.safe_load(f)
@@ -161,93 +167,6 @@ def decode_uploaded_image(image):
     return cv2.imdecode(image_buffer, cv2.IMREAD_COLOR)
 
 
-def clamp_float(value, lower, upper):
-    return max(lower, min(upper, value))
-
-
-def remove_shadow_with_gaussian(frame):
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    hue, saturation, value = cv2.split(hsv)
-
-    value_float = value.astype(np.float32)
-    frame_height, frame_width = value.shape[:2]
-    work_scale = clamp_float(SHADOW_FILTER_WORK_SCALE, 0.1, 1.0)
-    sigma = max(SHADOW_FILTER_SIGMA * work_scale, 1.0)
-    if work_scale < 1.0:
-        work_width = max(16, int(frame_width * work_scale))
-        work_height = max(16, int(frame_height * work_scale))
-        value_for_blur = cv2.resize(
-            value_float,
-            (work_width, work_height),
-            interpolation=cv2.INTER_AREA,
-        )
-    else:
-        value_for_blur = value_float
-
-    illumination = cv2.GaussianBlur(
-        value_for_blur,
-        (0, 0),
-        sigmaX=sigma,
-        sigmaY=sigma,
-    )
-    if work_scale < 1.0:
-        illumination = cv2.resize(
-            illumination,
-            (frame_width, frame_height),
-            interpolation=cv2.INTER_LINEAR,
-        )
-
-    illumination = np.maximum(illumination, 1.0)
-    scale = max(float(np.mean(illumination)), 1.0)
-    normalized_value = cv2.divide(value_float, illumination, scale=scale)
-    normalized_value = np.clip(normalized_value, 0, 255).astype(np.uint8)
-
-    if SHADOW_FILTER_CLAHE:
-        clahe = cv2.createCLAHE(
-            clipLimit=SHADOW_FILTER_CLAHE_CLIP,
-            tileGridSize=(8, 8),
-        )
-        normalized_value = clahe.apply(normalized_value)
-
-    strength = clamp_float(SHADOW_FILTER_STRENGTH, 0.0, 1.0)
-    corrected_value = cv2.addWeighted(value, 1.0 - strength, normalized_value, strength, 0)
-    corrected_hsv = cv2.merge((hue, saturation, corrected_value))
-    return cv2.cvtColor(corrected_hsv, cv2.COLOR_HSV2BGR)
-
-
-def resize_for_shadow_filter(frame):
-    frame_height, frame_width = frame.shape[:2]
-    max_side = max(frame_height, frame_width)
-    if SHADOW_FILTER_MAX_SIDE <= 0 or max_side <= SHADOW_FILTER_MAX_SIDE:
-        return frame, 1.0, 1.0
-
-    resize_scale = SHADOW_FILTER_MAX_SIDE / float(max_side)
-    resized_width = max(16, int(frame_width * resize_scale))
-    resized_height = max(16, int(frame_height * resize_scale))
-    resized_frame = cv2.resize(
-        frame,
-        (resized_width, resized_height),
-        interpolation=cv2.INTER_AREA,
-    )
-    return resized_frame, frame_width / float(resized_width), frame_height / float(resized_height)
-
-
-def preprocess_frame_for_detection(frame):
-    if not SHADOW_FILTER_ENABLED:
-        return frame, 1.0, 1.0
-    resized_frame, scale_x, scale_y = resize_for_shadow_filter(frame)
-    return remove_shadow_with_gaussian(resized_frame), scale_x, scale_y
-
-
-def scale_box_to_original_frame(box, scale_x, scale_y):
-    scaled_box = box.copy()
-    scaled_box[0] *= scale_x
-    scaled_box[2] *= scale_x
-    scaled_box[1] *= scale_y
-    scaled_box[3] *= scale_y
-    return scaled_box
-
-
 def make_warmup_image():
     size = max(32, YOLO_IMGSZ)
     return np.zeros((size, size, 3), dtype=np.uint8)
@@ -273,6 +192,8 @@ def get_model_path_candidates():
         for path in candidates
     ]
 
+
+# Flask 앱, YOLO 모델, 최신 탐지 상태를 서버 시작 시 한 번 초기화합니다.
 app = Flask(__name__)
 YOLO_MODEL_PATH_ENV = os.getenv("YOLO_MODEL_PATH")
 MODEL_PATH_FROM_ENV = bool(YOLO_MODEL_PATH_ENV)
@@ -317,14 +238,13 @@ print(
     f"cache={ENABLE_DETECT_CACHE}, min_interval={YOLO_MIN_INTERVAL}, "
     f"bypass_return_filter={YOLO_BYPASS_RETURN_FILTER}, "
     f"flask_threaded={SERVER_THREADED}, "
-    f"shadow_filter={SHADOW_FILTER_ENABLED}, shadow_sigma={SHADOW_FILTER_SIGMA}, "
-    f"shadow_scale={SHADOW_FILTER_WORK_SCALE}, shadow_max_side={SHADOW_FILTER_MAX_SIDE}, "
     f"cudnn={torch.backends.cudnn.enabled}, "
     f"cudnn_benchmark={torch.backends.cudnn.benchmark}"
 )
 
 if USE_CUDA_DEVICE:
-    warmup_image, _, _ = preprocess_frame_for_detection(make_warmup_image())
+    # CUDA 첫 추론 지연을 줄이기 위해 더미 이미지로 모델을 미리 한 번 돌립니다.
+    warmup_image = make_warmup_image()
     warmup_started_at = time.perf_counter()
     for _ in range(max(1, YOLO_WARMUP_RUNS)):
         with torch.inference_mode():
@@ -344,6 +264,7 @@ if USE_CUDA_DEVICE:
 print("YOLO server ready")
 
 
+# 캐시, 로그, 디버그 상태는 `/detect` 요청을 빠르게 처리하고 문제를 추적하기 위한 보조 흐름입니다.
 def get_cuda_device_name():
     if not torch.cuda.is_available():
         return None
@@ -552,7 +473,6 @@ def get_debug_state_payload():
         "yoloMaxDet": YOLO_MAX_DET,
         "maxReturnDetections": MAX_RETURN_DETECTIONS,
         "debugDetectionLimit": DEBUG_DETECTION_LIMIT,
-        "shadowFilterEnabled": SHADOW_FILTER_ENABLED,
         "detectCacheEnabled": ENABLE_DETECT_CACHE,
         "yoloMinInterval": YOLO_MIN_INTERVAL,
         "detectMode": DETECT_MODE,
@@ -577,7 +497,9 @@ def get_debug_state_payload():
         "cudaAvailable": torch.cuda.is_available(),
         "cudaDeviceName": get_cuda_device_name(),
     }
-# Fire/destruction is deferred; the current server only exercises movement and perception.
+
+
+# 현재는 발사/파괴 로직보다 이동과 인식 연결을 확인하기 위한 고정 행동 시퀀스입니다.
 combined_commands = [
     {
         "moveWS": {"command": "W", "weight": 1.0},
@@ -666,6 +588,7 @@ combined_commands = [
 ]
 
 
+# 메인 탐지 엔드포인트: 이미지 수신 -> YOLO 추론 -> 필터링 -> JSON 응답.
 @app.route('/detect', methods=['POST'])
 def detect():
     started_at = time.perf_counter()
@@ -673,16 +596,19 @@ def detect():
     if not image:
         return jsonify({"error": "No image received"}), 400
 
+    # 너무 짧은 간격으로 들어온 요청은 최신 결과를 재사용해 프레임 지연을 줄입니다.
     cached = get_cached_detections(time.time())
     if cached is not None:
         cached_results, cached_timestamp = cached
         return return_cached_response(started_at, cached_results, cached_timestamp, "fresh_interval")
 
+    # YOLO 추론은 무겁기 때문에 동시에 하나만 실행하고, 겹치는 요청은 캐시로 응답합니다.
     if not yolo_predict_lock.acquire(blocking=False):
         latest_results, latest_timestamp = get_latest_detections()
         return return_cached_response(started_at, latest_results, latest_timestamp, "inference_busy")
 
     try:
+        # 시뮬레이터가 보낸 이미지 파일을 OpenCV 프레임으로 디코딩합니다.
         decode_started_at = time.perf_counter()
         frame = decode_uploaded_image(image)
         decode_ms = (time.perf_counter() - decode_started_at) * 1000
@@ -693,10 +619,10 @@ def detect():
         frame_shape = [int(value) for value in original_shape]
         frame_mean = float(np.mean(frame))
         frame_std = float(np.std(frame))
-        preprocess_started_at = time.perf_counter()
-        frame, scale_x, scale_y = preprocess_frame_for_detection(frame)
-        preprocess_ms = (time.perf_counter() - preprocess_started_at) * 1000
+        # 전처리 단계는 제거했지만 디버그 응답 호환성을 위해 0.0으로 기록합니다.
+        preprocess_ms = 0.0
 
+        # 기본 confidence로 먼저 추론하고, 옵션이 켜져 있으면 빈 결과에 한해 낮은 confidence로 재시도합니다.
         yolo_started_at = time.perf_counter()
         model_conf_used = MODEL_CONFIDENCE_THRESHOLD
         fallback_used = False
@@ -732,6 +658,7 @@ def detect():
     finally:
         yolo_predict_lock.release()
 
+    # 모델 출력 박스를 시뮬레이터 응답 형식으로 바꾸고 confidence/클래스 기준으로 거릅니다.
     postprocess_started_at = time.perf_counter()
     boxes = results[0].boxes
     detections = boxes.data.detach().cpu().numpy() if boxes is not None else np.empty((0, 6))
@@ -743,21 +670,21 @@ def detect():
         model_class_name = model_names.get(class_id)
         class_name = get_public_class_name(class_id)
         confidence = float(box[4])
-        scaled_box = scale_box_to_original_frame(box, scale_x, scale_y)
+        box_coords = box[:4]
         bypass_return_filter = YOLO_BYPASS_RETURN_FILTER or (
             fallback_used and YOLO_RETURN_FALLBACK_DETECTIONS
         )
         returned, reject_reason, threshold = evaluate_detection_for_return(
             class_name,
             confidence,
-            scaled_box,
+            box_coords,
             original_shape,
             bypass_return_filter,
         )
         debug_detection = make_debug_detection(
             model_class_name,
             class_name,
-            scaled_box,
+            box_coords,
             confidence,
             returned,
             reject_reason,
@@ -768,13 +695,14 @@ def detect():
             rejected_detections.append(debug_detection)
             continue
 
-        filtered_results.append(make_detection_response(class_name, scaled_box, confidence))
+        filtered_results.append(make_detection_response(class_name, box_coords, confidence))
 
     filtered_results.sort(key=lambda detection: detection["confidence"], reverse=True)
     if not YOLO_BYPASS_RETURN_FILTER:
         filtered_results = filtered_results[:MAX_RETURN_DETECTIONS]
     postprocess_ms = (time.perf_counter() - postprocess_started_at) * 1000
     elapsed_ms = (time.perf_counter() - started_at) * 1000
+    # 마지막 탐지 상태를 저장해 `/debug_state`와 캐시 응답에서 재사용합니다.
     update_detect_state(
         filtered_results,
         time.time(),
@@ -814,6 +742,7 @@ def detect():
     return jsonify(filtered_results)
 
 
+# 디버그용 엔드포인트와 시뮬레이터가 호출하는 보조 API들입니다.
 @app.route('/debug_state', methods=['GET'])
 @app.route('/debug/perf', methods=['GET'])
 def debug_state():
@@ -924,7 +853,8 @@ def collision():
 
     return jsonify({'status': 'success', 'message': 'Collision data received'})
 
-#Endpoint called when the episode starts
+
+# 에피소드가 시작될 때 시뮬레이터가 읽는 초기 설정입니다.
 @app.route('/init', methods=['GET'])
 def init():
     config = {
