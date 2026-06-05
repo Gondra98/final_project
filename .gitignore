@@ -15,6 +15,7 @@ logs/
 # Model weights and training artifacts
 *.pt
 *.onnx
+*.engine
 *.mp4
 *.zip
 *.csv

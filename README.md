@@ -30,17 +30,17 @@ pip install -r requirements.txt
 pip install -r requirements-torch-cu128.txt
 ```
 
-모델 가중치는 Git에 커밋하지 않습니다. 학습된 최종 `best.pt` 파일은 팀원에게 따로 공유한 뒤,
+모델 가중치는 Git에 커밋하지 않습니다. 학습된 최종 `best_final.engine` 파일은 팀원에게 따로 공유한 뒤,
 아래 경로에 넣어 주세요:
 
 ```text
-models/tank_detector/best.pt
+models/tank_detector/best_final.engine
 ```
 
 또는 실행 전에 모델 경로를 직접 지정할 수 있습니다:
 
 ```powershell
-$env:YOLO_MODEL_PATH="models/tank_detector/best.pt"
+$env:YOLO_MODEL_PATH="models/tank_detector/best_final.engine"
 python scripts/yolo_detection_server.py
 ```
 
@@ -99,7 +99,7 @@ python scripts/yolo_detection_server.py
 Windows PowerShell에서 데모용 실행 옵션:
 
 ```powershell
-$env:YOLO_MODEL_PATH="models/tank_detector/best.pt"
+$env:YOLO_MODEL_PATH="models/tank_detector/best_final.engine"
 $env:YOLO_IMGSZ="512"
 $env:YOLO_MODEL_CONF="0.10"
 $env:YOLO_DEFAULT_CONF="0.20"
@@ -120,7 +120,7 @@ python scripts/yolo_detection_server.py
 더 빠른 대신 정확도는 낮아질 수 있는 테스트:
 
 ```powershell
-$env:YOLO_IMGSZ="416"
+$env:YOLO_IMGSZ="512"
 python scripts/yolo_detection_server.py
 ```
 
@@ -162,7 +162,7 @@ python scripts/yolo_detection_server.py
 디버그용 실행 옵션은 더 무겁지만 탐지 실패 원인을 찾을 때 유용합니다. `YOLO_LOW_CONF_FALLBACK=true`는 결과가 비어 있을 때 YOLO를 한 번 더 실행할 수 있으므로, 문제를 진단하는 상황이 아니라면 데모에서는 꺼두는 편이 좋습니다.
 
 ```powershell
-$env:YOLO_MODEL_PATH="models/tank_detector/best.pt"
+$env:YOLO_MODEL_PATH="models/tank_detector/best_final.engine"
 $env:YOLO_DETECT_CACHE="false"
 $env:YOLO_LOW_CONF_FALLBACK="true"
 $env:YOLO_RETURN_FALLBACK_DETECTIONS="true"
@@ -188,7 +188,7 @@ $env:YOLO_WALL_CONF="0.05"
 
 `/debug_state`로 실패 원인을 나눠서 확인할 수 있습니다:
 
-- `modelPath`: 어떤 `best.pt`가 로드되었는지 확인
+- `modelPath`: 어떤 `best_final.engine`가 로드되었는지 확인
 - `modelNames`와 `publicNames`: 모델 클래스 ID가 반환되는 `className` 값과 어떻게 매핑되는지 확인
 - `recognitionLogEnabled`: 콘솔 인식 로그가 켜져 있는지 확인
 - `latestRawDetectionCount=0`: 모델 경로, 모델 품질, 입력 이미지 문제 가능성

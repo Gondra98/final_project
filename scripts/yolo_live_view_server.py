@@ -1,5 +1,5 @@
 """
-Tank simulator -> Flask -> Web live view + async YOLO(best.pt)
+Tank simulator -> Flask -> Web live view + async YOLO(best_final.engine)
 
 이 파일은 디버깅/시각화에 초점을 둔 서버다.
 `yolo_detection_server.py`처럼 `/detect`를 제공하지만, 탐지는 백그라운드 worker가 처리하고
@@ -32,8 +32,8 @@ from ultralytics import YOLO
 # =========================
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
-DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "tank_detector" / "best.pt"
-# 웹 확인용 서버는 기본적으로 최종 best.pt를 사용하지만, YOLO_MODEL_PATH로 다른 weight를 지정할 수 있습니다.
+DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "tank_detector" / "best_final.engine"
+# 웹 확인용 서버는 기본적으로 최종 best_final.engine를 사용하지만, YOLO_MODEL_PATH로 다른 weight를 지정할 수 있습니다.
 YOLO_MODEL_PATH = Path(os.getenv("YOLO_MODEL_PATH", str(DEFAULT_MODEL_PATH)))
 if not YOLO_MODEL_PATH.is_absolute():
     YOLO_MODEL_PATH = (PROJECT_ROOT / YOLO_MODEL_PATH).resolve()
@@ -45,7 +45,8 @@ YOLO_DEVICE = os.getenv("YOLO_DEVICE", "0" if torch.cuda.is_available() else "cp
 USE_CUDA = torch.cuda.is_available() and YOLO_DEVICE.lower() != "cpu"
 # half precision은 CUDA에서만 의미가 있으므로 CPU 실행일 때는 자동으로 꺼집니다.
 YOLO_HALF = os.getenv("YOLO_HALF", "true").lower() in {"1", "true", "yes", "on"} and USE_CUDA
-YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "416"))
+REQUESTED_YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "512"))
+YOLO_IMGSZ = REQUESTED_YOLO_IMGSZ
 YOLO_CONF = float(os.getenv("YOLO_CONF", "0.20"))
 YOLO_IOU = float(os.getenv("YOLO_IOU", "0.70"))
 YOLO_MAX_DET = int(os.getenv("YOLO_MAX_DET", "30"))
@@ -66,11 +67,104 @@ app = Flask(__name__)
 
 if not YOLO_MODEL_PATH.exists():
     print(f"[WARNING] YOLO model not found: {YOLO_MODEL_PATH}")
-    print("          YOLO_MODEL_PATH 환경변수 또는 best.pt 위치를 확인하세요.")
+    print("          YOLO_MODEL_PATH 환경변수 또는 best_final.engine 위치를 확인하세요.")
 
+def ensure_model_runtime(model_path: Path) -> None:
+    if model_path.suffix.lower() != ".engine":
+        return
+    try:
+        __import__("tensorrt")
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "TensorRT Python package is required to load .engine models. "
+            "Install it in the active environment with: "
+            "python -m pip install --upgrade tensorrt-cu12"
+        ) from exc
+
+
+def get_tensorrt_engine_imgsz(model_path: Path) -> Optional[int]:
+    if model_path.suffix.lower() != ".engine":
+        return None
+    try:
+        import json
+        import tensorrt as trt
+
+        logger = trt.Logger(trt.Logger.WARNING)
+        with model_path.open("rb") as f, trt.Runtime(logger) as runtime:
+            try:
+                meta_len = int.from_bytes(f.read(4), byteorder="little")
+                json.loads(f.read(meta_len).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                f.seek(0)
+            engine = runtime.deserialize_cuda_engine(f.read())
+        if engine is None:
+            return None
+        is_trt10 = hasattr(engine, "num_io_tensors")
+        indices = range(engine.num_io_tensors) if is_trt10 else range(engine.num_bindings)
+        for index in indices:
+            if is_trt10:
+                tensor_name = engine.get_tensor_name(index)
+                if engine.get_tensor_mode(tensor_name) != trt.TensorIOMode.INPUT:
+                    continue
+                shape = tuple(int(dim) for dim in engine.get_tensor_shape(tensor_name))
+            else:
+                if not engine.binding_is_input(index):
+                    continue
+                shape = tuple(int(dim) for dim in engine.get_binding_shape(index))
+            if len(shape) >= 4 and shape[1] in {1, 3, 4}:
+                height, width = shape[2], shape[3]
+            elif len(shape) >= 3:
+                height, width = shape[1], shape[2]
+            else:
+                continue
+            if height > 0 and height == width:
+                return height
+    except Exception:
+        return None
+    return None
+
+
+def normalize_model_names(names):
+    if isinstance(names, dict):
+        return {int(class_id): str(name) for class_id, name in names.items()}
+    return {class_id: str(name) for class_id, name in enumerate(names)}
+
+
+def get_engine_load_error_message(model_path: Path) -> str:
+    return (
+        f"Failed to load TensorRT engine: {model_path}\n"
+        "TensorRT .engine files are tied to the platform/GPU/TensorRT runtime "
+        "they were built for. Re-export best_final.engine on this machine from "
+        "the original .pt or .onnx model.\n"
+        "Example:\n"
+        "  yolo export model=models/tank_detector/best.pt format=engine "
+        "task=detect imgsz=512 half=True device=0\n"
+        "Then rename/copy the generated engine to "
+        "models/tank_detector/best_final.engine."
+    )
+
+
+def load_yolo_model(model_path: Path):
+    try:
+        loaded_model = YOLO(str(model_path), task="detect")
+        loaded_names = normalize_model_names(loaded_model.names)
+    except (AttributeError, RuntimeError, ValueError) as exc:
+        if model_path.suffix.lower() == ".engine":
+            raise RuntimeError(get_engine_load_error_message(model_path)) from exc
+        raise
+    return loaded_model, loaded_names
+
+
+ensure_model_runtime(YOLO_MODEL_PATH)
+engine_imgsz = get_tensorrt_engine_imgsz(YOLO_MODEL_PATH)
+if engine_imgsz is not None and YOLO_IMGSZ != engine_imgsz:
+    print(
+        f"Overriding YOLO_IMGSZ={YOLO_IMGSZ} to TensorRT engine input size "
+        f"{engine_imgsz}."
+    )
+    YOLO_IMGSZ = engine_imgsz
 print(f"Loading YOLO model: {YOLO_MODEL_PATH}")
-model = YOLO(str(YOLO_MODEL_PATH))
-model_names = model.names if isinstance(model.names, dict) else {i: n for i, n in enumerate(model.names)}
+model, model_names = load_yolo_model(YOLO_MODEL_PATH)
 print(f"Model labels: {model_names}")
 print(
     "YOLO runtime: "
@@ -102,6 +196,40 @@ latest_frame_shape: Optional[List[int]] = None
 latest_error: Optional[str] = None
 request_count: int = 0
 worker_count: int = 0
+
+CLASS_COLORS_BGR = {
+    "tank": (0, 0, 255),
+    "wall": (255, 0, 0),
+    "rock": (0, 255, 255),
+    "person": (0, 255, 0),
+    "tent": (255, 255, 0),
+    "car": (255, 0, 255),
+}
+CLASS_COLOR_PALETTE_BGR = [
+    (0, 255, 0),
+    (0, 0, 255),
+    (255, 0, 0),
+    (0, 255, 255),
+    (255, 0, 255),
+    (255, 255, 0),
+    (255, 255, 255),
+]
+
+
+def get_class_bgr_color(class_name: str, class_id: int = 0) -> Tuple[int, int, int]:
+    normalized_name = str(class_name).strip().lower()
+    if normalized_name in CLASS_COLORS_BGR:
+        return CLASS_COLORS_BGR[normalized_name]
+    return CLASS_COLOR_PALETTE_BGR[class_id % len(CLASS_COLOR_PALETTE_BGR)]
+
+
+def bgr_to_hex(color: Tuple[int, int, int]) -> str:
+    blue, green, red = (int(value) for value in color)
+    return f"#{red:02X}{green:02X}{blue:02X}"
+
+
+def get_class_hex_color(class_name: str, class_id: int = 0) -> str:
+    return bgr_to_hex(get_class_bgr_color(class_name, class_id))
 
 # =========================
 # 유틸 함수
@@ -146,13 +274,14 @@ def run_yolo_only(frame: np.ndarray) -> Tuple[List[Dict[str, Any]], float, float
             x1, y1, x2, y2, conf, cls_id = box[:6]
             class_id = int(cls_id)
             class_name = str(model_names.get(class_id, class_id))
+            color = get_class_hex_color(class_name, class_id)
             detections.append(
                 {
                     "className": class_name,
                     "classId": class_id,
                     "confidence": float(conf),
                     "bbox": [float(x1), float(y1), float(x2), float(y2)],
-                    "color": "#00FF00",
+                    "color": color,
                     "filled": False,
                     "updateBoxWhileMoving": False,
                 }
@@ -170,15 +299,17 @@ def draw_detections(frame: np.ndarray, detections: List[Dict[str, Any]]) -> np.n
             continue
         x1, y1, x2, y2 = map(int, bbox[:4])
         class_name = det.get("className", "object")
+        class_id = int(det.get("classId", 0))
         conf = float(det.get("confidence", 0.0))
-        cv2.rectangle(drawn, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        color = get_class_bgr_color(class_name, class_id)
+        cv2.rectangle(drawn, (x1, y1), (x2, y2), color, 2)
         cv2.putText(
             drawn,
             f"{class_name} {conf:.2f}",
             (x1, max(20, y1 - 8)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
-            (0, 255, 0),
+            color,
             2,
             cv2.LINE_AA,
         )
@@ -449,6 +580,7 @@ def debug_state():
             "cudaAvailable": torch.cuda.is_available(),
             "half": YOLO_HALF,
             "imgsz": YOLO_IMGSZ,
+            "requestedImgsz": REQUESTED_YOLO_IMGSZ,
             "conf": YOLO_CONF,
             "latestFrameSeq": latest_frame_seq,
             "processedFrameSeq": processed_frame_seq,

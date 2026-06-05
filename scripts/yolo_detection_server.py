@@ -8,7 +8,7 @@ Tank 시뮬레이터와 YOLO 모델을 연결하는 Flask 서버.
 
 큰 흐름:
 1. 환경변수와 `configs/simulator.yaml`에서 실행 설정을 읽는다.
-2. 사용할 YOLO `best.pt` 모델을 고르고 서버 시작 시 한 번 로드한다.
+2. 사용할 YOLO `best_final.engine` 모델을 고르고 서버 시작 시 한 번 로드한다.
 3. 시뮬레이터가 `/detect`로 보낸 이미지를 YOLO로 추론한다.
 4. 탐지 결과를 시뮬레이터가 기대하는 JSON 형식으로 필터링해 반환한다.
 5. `/init`, `/get_action` 등 시뮬레이터 제어용 API도 같은 서버에서 처리한다.
@@ -30,7 +30,7 @@ import yaml
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 CONFIG_PATH = PROJECT_ROOT / "configs" / "simulator.yaml"
-DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "tank_detector" / "best.pt"
+DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "tank_detector" / "best_final.engine"
 # `YOLO_MODEL_PATH` 환경변수를 주면 기본 모델 대신 해당 weight를 사용합니다.
 CLASS_ALIASES = {
     "blue": "person",
@@ -39,6 +39,39 @@ CLASS_ALIASES = {
 }
 # 학습 데이터에는 남아 있어도 시뮬레이터 제어에는 쓰지 않는 클래스입니다.
 IGNORED_CLASSES = {"car"}
+CLASS_COLORS_BGR = {
+    "tank": (0, 0, 255),
+    "wall": (255, 0, 0),
+    "rock": (0, 255, 255),
+    "person": (0, 255, 0),
+    "tent": (255, 255, 0),
+    "car": (255, 0, 255),
+}
+CLASS_COLOR_PALETTE_BGR = [
+    (0, 255, 0),
+    (0, 0, 255),
+    (255, 0, 0),
+    (0, 255, 255),
+    (255, 0, 255),
+    (255, 255, 0),
+    (255, 255, 255),
+]
+
+
+def get_class_bgr_color(class_name, class_id=0):
+    normalized_name = str(class_name).strip().lower()
+    if normalized_name in CLASS_COLORS_BGR:
+        return CLASS_COLORS_BGR[normalized_name]
+    return CLASS_COLOR_PALETTE_BGR[class_id % len(CLASS_COLOR_PALETTE_BGR)]
+
+
+def bgr_to_hex(color):
+    blue, green, red = (int(value) for value in color)
+    return f"#{red:02X}{green:02X}{blue:02X}"
+
+
+def get_class_hex_color(class_name, class_id=0):
+    return bgr_to_hex(get_class_bgr_color(class_name, class_id))
 
 # 모델 입력 단계의 confidence와 응답 반환 단계의 confidence를 분리했습니다.
 # 낮은 모델 confidence는 후보를 넓게 잡기 위한 값이고, DEFAULT_CONFIDENCE_THRESHOLD가 실제 반환 필터입니다.
@@ -66,7 +99,8 @@ def env_flag(name, default=False):
 # CUDA가 있으면 기본적으로 GPU 0번을 사용하고, 명시적으로 cpu를 지정하면 CPU로 고정합니다.
 YOLO_DEVICE = os.getenv("YOLO_DEVICE", "0" if torch.cuda.is_available() else "cpu")
 USE_CUDA_DEVICE = torch.cuda.is_available() and YOLO_DEVICE.lower() != "cpu"
-YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "512"))
+REQUESTED_YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "512"))
+YOLO_IMGSZ = REQUESTED_YOLO_IMGSZ
 YOLO_HALF = USE_CUDA_DEVICE and env_flag("YOLO_HALF", True)
 YOLO_TIMING = env_flag("YOLO_TIMING", env_flag("DEBUG_PERF_LOG", False))
 YOLO_DETECT_DEBUG = env_flag("YOLO_DETECT_DEBUG", False)
@@ -208,12 +242,99 @@ def get_model_path_candidates():
 
 
 # Flask 앱, YOLO 모델, 최신 탐지 상태를 서버 시작 시 한 번 초기화합니다.
+def ensure_model_runtime(model_path):
+    if model_path.suffix.lower() != ".engine":
+        return
+    try:
+        __import__("tensorrt")
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "TensorRT Python package is required to load .engine models. "
+            "Install it in the active environment with: "
+            "python -m pip install --upgrade tensorrt-cu12"
+        ) from exc
+
+
+def get_tensorrt_engine_imgsz(model_path):
+    if model_path.suffix.lower() != ".engine":
+        return None
+    try:
+        import json
+        import tensorrt as trt
+
+        logger = trt.Logger(trt.Logger.WARNING)
+        with model_path.open("rb") as f, trt.Runtime(logger) as runtime:
+            try:
+                meta_len = int.from_bytes(f.read(4), byteorder="little")
+                json.loads(f.read(meta_len).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                f.seek(0)
+            engine = runtime.deserialize_cuda_engine(f.read())
+        if engine is None:
+            return None
+        is_trt10 = hasattr(engine, "num_io_tensors")
+        indices = range(engine.num_io_tensors) if is_trt10 else range(engine.num_bindings)
+        for index in indices:
+            if is_trt10:
+                tensor_name = engine.get_tensor_name(index)
+                if engine.get_tensor_mode(tensor_name) != trt.TensorIOMode.INPUT:
+                    continue
+                shape = tuple(int(dim) for dim in engine.get_tensor_shape(tensor_name))
+            else:
+                if not engine.binding_is_input(index):
+                    continue
+                shape = tuple(int(dim) for dim in engine.get_binding_shape(index))
+            if len(shape) >= 4 and shape[1] in {1, 3, 4}:
+                height, width = shape[2], shape[3]
+            elif len(shape) >= 3:
+                height, width = shape[1], shape[2]
+            else:
+                continue
+            if height > 0 and height == width:
+                return height
+    except Exception:
+        return None
+    return None
+
+
+def get_engine_load_error_message(model_path):
+    return (
+        f"Failed to load TensorRT engine: {model_path}\n"
+        "TensorRT .engine files are tied to the platform/GPU/TensorRT runtime "
+        "they were built for. Re-export best_final.engine on this machine from "
+        "the original .pt or .onnx model.\n"
+        "Example:\n"
+        "  yolo export model=models/tank_detector/best.pt format=engine "
+        "task=detect imgsz=512 half=True device=0\n"
+        "Then rename/copy the generated engine to "
+        "models/tank_detector/best_final.engine."
+    )
+
+
+def load_yolo_model(model_path):
+    try:
+        loaded_model = YOLO(str(model_path), task="detect")
+        loaded_names = normalize_model_names(loaded_model.names)
+    except (AttributeError, RuntimeError, ValueError) as exc:
+        if model_path.suffix.lower() == ".engine":
+            raise RuntimeError(get_engine_load_error_message(model_path)) from exc
+        raise
+    return loaded_model, loaded_names
+
+
 app = Flask(__name__)
 YOLO_MODEL_PATH_ENV = os.getenv("YOLO_MODEL_PATH")
 MODEL_PATH_FROM_ENV = bool(YOLO_MODEL_PATH_ENV)
 MODEL_PATH = resolve_model_path()
-model = YOLO(str(MODEL_PATH))
-model_names = normalize_model_names(model.names)
+ensure_model_runtime(MODEL_PATH)
+engine_imgsz = get_tensorrt_engine_imgsz(MODEL_PATH)
+if engine_imgsz is not None and YOLO_IMGSZ != engine_imgsz:
+    print(
+        f"Overriding YOLO_IMGSZ={YOLO_IMGSZ} to TensorRT engine input size "
+        f"{engine_imgsz}."
+    )
+    YOLO_IMGSZ = engine_imgsz
+model, model_names = load_yolo_model(MODEL_PATH)
 public_names = get_public_model_names()
 detect_state_lock = Lock()
 # Ultralytics 추론은 무거운 작업이라 요청이 겹칠 때 동시에 여러 번 돌리지 않도록 별도 lock을 둡니다.
@@ -426,13 +547,13 @@ def log_recognized_detections(detections, cached=False):
         )
 
 
-def make_detection_response(class_name, box, confidence):
+def make_detection_response(class_name, box, confidence, class_id=0):
     """시뮬레이터가 기대하는 detection JSON 필드만 남깁니다."""
     return {
         "className": class_name,
         "bbox": [float(coord) for coord in box[:4]],
         "confidence": confidence,
-        "color": "#00FF00",
+        "color": get_class_hex_color(class_name, class_id),
         "filled": False,
         "updateBoxWhileMoving": False,
     }
@@ -441,6 +562,7 @@ def make_detection_response(class_name, box, confidence):
 def make_debug_detection(
     model_class_name,
     class_name,
+    class_id,
     box,
     confidence,
     returned,
@@ -453,6 +575,7 @@ def make_debug_detection(
         "className": class_name,
         "bbox": [float(coord) for coord in box[:4]],
         "confidence": confidence,
+        "color": get_class_hex_color(class_name, class_id),
         "returned": returned,
         "rejectReason": reject_reason,
         "threshold": threshold,
@@ -483,6 +606,7 @@ def get_debug_state_payload():
         "modelNames": model_names,
         "publicNames": public_names,
         "yoloImgsz": YOLO_IMGSZ,
+        "requestedYoloImgsz": REQUESTED_YOLO_IMGSZ,
         "modelConf": MODEL_CONFIDENCE_THRESHOLD,
         "fallbackModelConf": FALLBACK_MODEL_CONFIDENCE_THRESHOLD,
         "lowConfFallbackEnabled": YOLO_LOW_CONF_FALLBACK,
@@ -709,6 +833,7 @@ def detect():
         debug_detection = make_debug_detection(
             model_class_name,
             class_name,
+            class_id,
             box_coords,
             confidence,
             returned,
@@ -720,7 +845,9 @@ def detect():
             rejected_detections.append(debug_detection)
             continue
 
-        filtered_results.append(make_detection_response(class_name, box_coords, confidence))
+        filtered_results.append(
+            make_detection_response(class_name, box_coords, confidence, class_id)
+        )
 
     filtered_results.sort(key=lambda detection: detection["confidence"], reverse=True)
     if not YOLO_BYPASS_RETURN_FILTER:
