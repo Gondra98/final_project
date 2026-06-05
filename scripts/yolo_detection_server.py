@@ -134,7 +134,7 @@ def env_flag(name, default=False):
 # CUDA가 있으면 기본적으로 GPU 0번을 사용하고, 명시적으로 cpu를 지정하면 CPU로 고정합니다.
 YOLO_DEVICE = os.getenv("YOLO_DEVICE", "0" if torch.cuda.is_available() else "cpu")
 USE_CUDA_DEVICE = torch.cuda.is_available() and YOLO_DEVICE.lower() != "cpu"
-REQUESTED_YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "512"))
+REQUESTED_YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "416"))
 YOLO_IMGSZ = REQUESTED_YOLO_IMGSZ
 YOLO_HALF = USE_CUDA_DEVICE and env_flag("YOLO_HALF", True)
 YOLO_TIMING = env_flag("YOLO_TIMING", env_flag("DEBUG_PERF_LOG", False))
@@ -340,7 +340,7 @@ def get_engine_load_error_message(model_path):
         "the original .pt or .onnx model.\n"
         "Example:\n"
         "  yolo export model=models/tank_detector/best.pt format=engine "
-        "task=detect imgsz=512 half=True device=0\n"
+        "task=detect imgsz=416 half=True device=0\n"
         "Then rename/copy the generated engine to "
         "models/tank_detector/best_final.engine."
     )

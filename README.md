@@ -80,7 +80,7 @@ python scripts/yolo_detection_server.py
 
 기본 실행 설정은 YOLO 단독 데모 탐지에 맞춰져 있습니다:
 
-- `YOLO_IMGSZ=512`
+- `YOLO_IMGSZ=416`
 - `YOLO_MODEL_CONF=0.10`
 - `YOLO_DEFAULT_CONF=0.20`
 - `YOLO_WALL_CONF=0.15`
@@ -100,7 +100,7 @@ Windows PowerShell에서 데모용 실행 옵션:
 
 ```powershell
 $env:YOLO_MODEL_PATH="models/tank_detector/best_final.engine"
-$env:YOLO_IMGSZ="512"
+$env:YOLO_IMGSZ="416"
 $env:YOLO_MODEL_CONF="0.10"
 $env:YOLO_DEFAULT_CONF="0.20"
 $env:YOLO_WALL_CONF="0.15"
@@ -120,7 +120,7 @@ python scripts/yolo_detection_server.py
 더 빠른 대신 정확도는 낮아질 수 있는 테스트:
 
 ```powershell
-$env:YOLO_IMGSZ="512"
+$env:YOLO_IMGSZ="416"
 python scripts/yolo_detection_server.py
 ```
 

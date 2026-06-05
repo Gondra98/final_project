@@ -46,7 +46,7 @@ YOLO_DEVICE = os.getenv("YOLO_DEVICE", "0" if torch.cuda.is_available() else "cp
 USE_CUDA = torch.cuda.is_available() and YOLO_DEVICE.lower() != "cpu"
 # half precision은 CUDA에서만 의미가 있으므로 CPU 실행일 때는 자동으로 꺼집니다.
 YOLO_HALF = os.getenv("YOLO_HALF", "true").lower() in {"1", "true", "yes", "on"} and USE_CUDA
-REQUESTED_YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "512"))
+REQUESTED_YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "416"))
 YOLO_IMGSZ = REQUESTED_YOLO_IMGSZ
 YOLO_CONF = float(os.getenv("YOLO_CONF", "0.20"))
 YOLO_IOU = float(os.getenv("YOLO_IOU", "0.70"))
@@ -141,7 +141,7 @@ def get_engine_load_error_message(model_path: Path) -> str:
         "the original .pt or .onnx model.\n"
         "Example:\n"
         "  yolo export model=models/tank_detector/best.pt format=engine "
-        "task=detect imgsz=512 half=True device=0\n"
+        "task=detect imgsz=416 half=True device=0\n"
         "Then rename/copy the generated engine to "
         "models/tank_detector/best_final.engine."
     )
