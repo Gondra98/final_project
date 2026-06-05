@@ -16,6 +16,7 @@ Tank 시뮬레이터와 YOLO 모델을 연결하는 Flask 서버.
 
 from flask import Flask, request, jsonify
 import os
+import math
 from pathlib import Path
 from threading import Lock
 import time
@@ -56,6 +57,14 @@ CLASS_COLOR_PALETTE_BGR = [
     (255, 255, 0),
     (255, 255, 255),
 ]
+CLASS_HEIGHTS_M = {
+    "tank": float(os.getenv("YOLO_DISTANCE_TANK_HEIGHT_M", "2.4")),
+    "wall": float(os.getenv("YOLO_DISTANCE_WALL_HEIGHT_M", "2.0")),
+    "rock": float(os.getenv("YOLO_DISTANCE_ROCK_HEIGHT_M", "0.8")),
+    "person": float(os.getenv("YOLO_DISTANCE_PERSON_HEIGHT_M", "1.7")),
+    "tent": float(os.getenv("YOLO_DISTANCE_TENT_HEIGHT_M", "1.6")),
+    "car": float(os.getenv("YOLO_DISTANCE_CAR_HEIGHT_M", "1.5")),
+}
 
 
 def get_class_bgr_color(class_name, class_id=0):
@@ -73,6 +82,30 @@ def bgr_to_hex(color):
 def get_class_hex_color(class_name, class_id=0):
     return bgr_to_hex(get_class_bgr_color(class_name, class_id))
 
+
+def get_class_height_m(class_name):
+    return CLASS_HEIGHTS_M.get(str(class_name).strip().lower())
+
+
+def estimate_distance_by_height(class_name, box, frame_shape):
+    if box is None or len(box) < 4 or frame_shape is None:
+        return None
+    reference_height_m = get_class_height_m(class_name)
+    if reference_height_m is None or reference_height_m <= 0:
+        return None
+
+    box_height_px = max(0.0, float(box[3]) - float(box[1]))
+    if box_height_px < YOLO_DISTANCE_MIN_BOX_HEIGHT:
+        return None
+
+    frame_height_px = max(1.0, float(frame_shape[0]))
+    if not 0 < YOLO_DISTANCE_FOV_DEG < 180:
+        return None
+    half_fov_rad = math.radians(YOLO_DISTANCE_FOV_DEG) / 2.0
+    focal_length_px = frame_height_px / (2.0 * math.tan(half_fov_rad))
+    distance_m = (reference_height_m * focal_length_px) / box_height_px
+    return round(float(distance_m), 2)
+
 # 모델 입력 단계의 confidence와 응답 반환 단계의 confidence를 분리했습니다.
 # 낮은 모델 confidence는 후보를 넓게 잡기 위한 값이고, DEFAULT_CONFIDENCE_THRESHOLD가 실제 반환 필터입니다.
 MODEL_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_MODEL_CONF", "0.10"))
@@ -84,6 +117,8 @@ CLOSE_WALL_AREA_RATIO = float(os.getenv("YOLO_CLOSE_WALL_AREA_RATIO", "0.08"))
 CLOSE_WALL_MIN_HEIGHT_RATIO = float(os.getenv("YOLO_CLOSE_WALL_MIN_HEIGHT_RATIO", "0.35"))
 YOLO_IOU = float(os.getenv("YOLO_IOU", "0.70"))
 YOLO_MAX_DET = int(os.getenv("YOLO_MAX_DET", "20"))
+YOLO_DISTANCE_FOV_DEG = float(os.getenv("YOLO_DISTANCE_FOV_DEG", "60"))
+YOLO_DISTANCE_MIN_BOX_HEIGHT = float(os.getenv("YOLO_DISTANCE_MIN_BOX_HEIGHT", "2"))
 MAX_RETURN_DETECTIONS = int(os.getenv("YOLO_MAX_RETURN", "30"))
 DEBUG_DETECTION_LIMIT = int(os.getenv("YOLO_DEBUG_DET_LIMIT", "10"))
 
@@ -540,19 +575,24 @@ def log_recognized_detections(detections, cached=False):
     for detection in detections:
         bbox = detection.get("bbox", [])
         bbox_text = ", ".join(f"{float(coord):.1f}" for coord in bbox[:4])
+        distance = detection.get("distance")
+        distance_text = "N/A" if distance is None else f"{float(distance):.2f}m"
         print(
             f"[detect] class={detection.get('className')} "
             f"conf={float(detection.get('confidence', 0.0)):.2f} "
+            f"distance={distance_text} "
             f"bbox=[{bbox_text}]"
         )
 
 
-def make_detection_response(class_name, box, confidence, class_id=0):
+def make_detection_response(class_name, box, confidence, class_id=0, frame_shape=None):
     """시뮬레이터가 기대하는 detection JSON 필드만 남깁니다."""
+    distance = estimate_distance_by_height(class_name, box, frame_shape)
     return {
         "className": class_name,
         "bbox": [float(coord) for coord in box[:4]],
         "confidence": confidence,
+        "distance": distance,
         "color": get_class_hex_color(class_name, class_id),
         "filled": False,
         "updateBoxWhileMoving": False,
@@ -568,13 +608,16 @@ def make_debug_detection(
     returned,
     reject_reason,
     threshold,
+    frame_shape=None,
 ):
     """필터 통과/거절 이유까지 포함한 디버그용 detection 항목을 만듭니다."""
+    distance = estimate_distance_by_height(class_name, box, frame_shape)
     item = {
         "modelClassName": model_class_name,
         "className": class_name,
         "bbox": [float(coord) for coord in box[:4]],
         "confidence": confidence,
+        "distance": distance,
         "color": get_class_hex_color(class_name, class_id),
         "returned": returned,
         "rejectReason": reject_reason,
@@ -607,6 +650,8 @@ def get_debug_state_payload():
         "publicNames": public_names,
         "yoloImgsz": YOLO_IMGSZ,
         "requestedYoloImgsz": REQUESTED_YOLO_IMGSZ,
+        "distanceFovDeg": YOLO_DISTANCE_FOV_DEG,
+        "distanceClassHeightsM": CLASS_HEIGHTS_M,
         "modelConf": MODEL_CONFIDENCE_THRESHOLD,
         "fallbackModelConf": FALLBACK_MODEL_CONFIDENCE_THRESHOLD,
         "lowConfFallbackEnabled": YOLO_LOW_CONF_FALLBACK,
@@ -839,6 +884,7 @@ def detect():
             returned,
             reject_reason,
             threshold,
+            original_shape,
         )
         raw_detections.append(debug_detection)
         if not returned:
@@ -846,7 +892,13 @@ def detect():
             continue
 
         filtered_results.append(
-            make_detection_response(class_name, box_coords, confidence, class_id)
+            make_detection_response(
+                class_name,
+                box_coords,
+                confidence,
+                class_id,
+                original_shape,
+            )
         )
 
     filtered_results.sort(key=lambda detection: detection["confidence"], reverse=True)
