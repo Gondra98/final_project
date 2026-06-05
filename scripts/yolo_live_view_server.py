@@ -16,6 +16,7 @@ Tank simulator -> Flask -> Web live view + async YOLO(best_final.engine)
 from __future__ import annotations
 
 import os
+import math
 import time
 from pathlib import Path
 from threading import Condition, Lock, Thread
@@ -50,6 +51,8 @@ YOLO_IMGSZ = REQUESTED_YOLO_IMGSZ
 YOLO_CONF = float(os.getenv("YOLO_CONF", "0.20"))
 YOLO_IOU = float(os.getenv("YOLO_IOU", "0.70"))
 YOLO_MAX_DET = int(os.getenv("YOLO_MAX_DET", "30"))
+YOLO_DISTANCE_FOV_DEG = float(os.getenv("YOLO_DISTANCE_FOV_DEG", "60"))
+YOLO_DISTANCE_MIN_BOX_HEIGHT = float(os.getenv("YOLO_DISTANCE_MIN_BOX_HEIGHT", "2"))
 
 WEB_FPS = float(os.getenv("WEB_FPS", "20"))
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "80"))
@@ -214,6 +217,14 @@ CLASS_COLOR_PALETTE_BGR = [
     (255, 255, 0),
     (255, 255, 255),
 ]
+CLASS_HEIGHTS_M = {
+    "tank": float(os.getenv("YOLO_DISTANCE_TANK_HEIGHT_M", "2.4")),
+    "wall": float(os.getenv("YOLO_DISTANCE_WALL_HEIGHT_M", "2.0")),
+    "rock": float(os.getenv("YOLO_DISTANCE_ROCK_HEIGHT_M", "0.8")),
+    "person": float(os.getenv("YOLO_DISTANCE_PERSON_HEIGHT_M", "1.7")),
+    "tent": float(os.getenv("YOLO_DISTANCE_TENT_HEIGHT_M", "1.6")),
+    "car": float(os.getenv("YOLO_DISTANCE_CAR_HEIGHT_M", "1.5")),
+}
 
 
 def get_class_bgr_color(class_name: str, class_id: int = 0) -> Tuple[int, int, int]:
@@ -230,6 +241,34 @@ def bgr_to_hex(color: Tuple[int, int, int]) -> str:
 
 def get_class_hex_color(class_name: str, class_id: int = 0) -> str:
     return bgr_to_hex(get_class_bgr_color(class_name, class_id))
+
+
+def get_class_height_m(class_name: str) -> Optional[float]:
+    return CLASS_HEIGHTS_M.get(str(class_name).strip().lower())
+
+
+def estimate_distance_by_height(
+    class_name: str,
+    bbox: List[float],
+    frame_shape: Tuple[int, ...],
+) -> Optional[float]:
+    if len(bbox) < 4:
+        return None
+    reference_height_m = get_class_height_m(class_name)
+    if reference_height_m is None or reference_height_m <= 0:
+        return None
+
+    box_height_px = max(0.0, float(bbox[3]) - float(bbox[1]))
+    if box_height_px < YOLO_DISTANCE_MIN_BOX_HEIGHT:
+        return None
+
+    frame_height_px = max(1.0, float(frame_shape[0]))
+    if not 0 < YOLO_DISTANCE_FOV_DEG < 180:
+        return None
+    half_fov_rad = math.radians(YOLO_DISTANCE_FOV_DEG) / 2.0
+    focal_length_px = frame_height_px / (2.0 * math.tan(half_fov_rad))
+    distance_m = (reference_height_m * focal_length_px) / box_height_px
+    return round(float(distance_m), 2)
 
 # =========================
 # 유틸 함수
@@ -275,12 +314,15 @@ def run_yolo_only(frame: np.ndarray) -> Tuple[List[Dict[str, Any]], float, float
             class_id = int(cls_id)
             class_name = str(model_names.get(class_id, class_id))
             color = get_class_hex_color(class_name, class_id)
+            bbox = [float(x1), float(y1), float(x2), float(y2)]
+            distance = estimate_distance_by_height(class_name, bbox, frame.shape)
             detections.append(
                 {
                     "className": class_name,
                     "classId": class_id,
                     "confidence": float(conf),
-                    "bbox": [float(x1), float(y1), float(x2), float(y2)],
+                    "bbox": bbox,
+                    "distance": distance,
                     "color": color,
                     "filled": False,
                     "updateBoxWhileMoving": False,
@@ -301,11 +343,13 @@ def draw_detections(frame: np.ndarray, detections: List[Dict[str, Any]]) -> np.n
         class_name = det.get("className", "object")
         class_id = int(det.get("classId", 0))
         conf = float(det.get("confidence", 0.0))
+        distance = det.get("distance")
+        distance_text = f" {distance:.1f}m" if distance is not None else " N/A"
         color = get_class_bgr_color(class_name, class_id)
         cv2.rectangle(drawn, (x1, y1), (x2, y2), color, 2)
         cv2.putText(
             drawn,
-            f"{class_name} {conf:.2f}",
+            f"{class_name} {conf:.2f}{distance_text}",
             (x1, max(20, y1 - 8)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
@@ -391,7 +435,13 @@ def yolo_worker_loop() -> None:
                 )
             if PRINT_DETECTION_LOG and detections:
                 for det in detections:
-                    print(f"[det] class={det['className']} conf={det['confidence']:.2f} bbox={det['bbox']}")
+                    distance = det.get("distance")
+                    distance_text = "N/A" if distance is None else f"{distance:.2f}m"
+                    print(
+                        f"[det] class={det['className']} "
+                        f"conf={det['confidence']:.2f} distance={distance_text} "
+                        f"bbox={det['bbox']}"
+                    )
         except Exception as exc:  # noqa: BLE001
             with state_lock:
                 latest_error = str(exc)
@@ -581,6 +631,8 @@ def debug_state():
             "half": YOLO_HALF,
             "imgsz": YOLO_IMGSZ,
             "requestedImgsz": REQUESTED_YOLO_IMGSZ,
+            "distanceFovDeg": YOLO_DISTANCE_FOV_DEG,
+            "distanceClassHeightsM": CLASS_HEIGHTS_M,
             "conf": YOLO_CONF,
             "latestFrameSeq": latest_frame_seq,
             "processedFrameSeq": processed_frame_seq,
