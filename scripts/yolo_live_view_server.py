@@ -2,7 +2,7 @@
 Tank simulator -> Flask -> Web live view + async YOLO(best.pt)
 
 이 파일은 디버깅/시각화에 초점을 둔 서버다.
-`run_yolo_server.py`처럼 `/detect`를 제공하지만, 탐지는 백그라운드 worker가 처리하고
+`yolo_detection_server.py`처럼 `/detect`를 제공하지만, 탐지는 백그라운드 worker가 처리하고
 웹 페이지(`/view`)는 최신 프레임 위에 마지막 bbox를 덧그려 보여준다.
 
 핵심 구조
@@ -31,11 +31,12 @@ from ultralytics import YOLO
 # 환경 설정
 # =========================
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_MODEL_PATH = SCRIPT_DIR / "best.pt"
-# 웹 확인용 서버는 기본적으로 scripts/best.pt를 사용하지만, YOLO_MODEL_PATH로 다른 weight를 지정할 수 있습니다.
+PROJECT_ROOT = SCRIPT_DIR.parent
+DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "tank_detector" / "best.pt"
+# 웹 확인용 서버는 기본적으로 최종 best.pt를 사용하지만, YOLO_MODEL_PATH로 다른 weight를 지정할 수 있습니다.
 YOLO_MODEL_PATH = Path(os.getenv("YOLO_MODEL_PATH", str(DEFAULT_MODEL_PATH)))
 if not YOLO_MODEL_PATH.is_absolute():
-    YOLO_MODEL_PATH = (SCRIPT_DIR / YOLO_MODEL_PATH).resolve()
+    YOLO_MODEL_PATH = (PROJECT_ROOT / YOLO_MODEL_PATH).resolve()
 
 HOST = os.getenv("SERVER_HOST", "0.0.0.0")
 PORT = int(os.getenv("SERVER_PORT", "5000"))

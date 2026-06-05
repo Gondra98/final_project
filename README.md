@@ -30,20 +30,18 @@ pip install -r requirements.txt
 pip install -r requirements-torch-cu128.txt
 ```
 
-모델 가중치는 Git에 커밋하지 않습니다. 학습된 `best.pt` 파일은 팀원에게 따로 공유한 뒤,
-아래 경로 중 하나에 넣어 주세요:
+모델 가중치는 Git에 커밋하지 않습니다. 학습된 최종 `best.pt` 파일은 팀원에게 따로 공유한 뒤,
+아래 경로에 넣어 주세요:
 
 ```text
-runs/detect/finetune_tankkk2_valfix_30/weights/best.pt
-runs/detect/finetune_tankkk2-2/weights/best.pt
-runs/detect/first_yolo11n/weights/best.pt
+models/tank_detector/best.pt
 ```
 
 또는 실행 전에 모델 경로를 직접 지정할 수 있습니다:
 
 ```powershell
-$env:YOLO_MODEL_PATH="runs/detect/finetune_tankkk2_valfix_30/weights/best.pt"
-python scripts/run_yolo_server.py
+$env:YOLO_MODEL_PATH="models/tank_detector/best.pt"
+python scripts/yolo_detection_server.py
 ```
 
 서버가 정상 실행 중인지 확인합니다:
@@ -58,9 +56,10 @@ Invoke-RestMethod http://127.0.0.1:5000/debug_state
 ## 프로젝트 구조
 
 - `configs/`: 시뮬레이터 연결 설정
-- `scripts/run_yolo_server.py`: YOLO 탐지를 포함한 Flask 서버
+- `scripts/yolo_detection_server.py`: YOLO 탐지를 포함한 Flask 서버
+- `scripts/yolo_live_view_server.py`: YOLO 탐지 결과를 웹 화면에서 확인하는 디버그 서버
 - `scripts/run_simulator_client.py`: 시뮬레이터 클라이언트 실행 진입점
-- `scripts/train_yolo_wall_detector.py`: Roboflow 데이터셋 병합 및 YOLO 파인튜닝 스크립트
+- `scripts/train_yolo_detector.py`: Roboflow 데이터셋 병합 및 YOLO 파인튜닝 스크립트
 - `src/`: 재사용 가능한 시뮬레이터, 인식, 경로 계획, RL 모듈
 - `tests/`: 자동화 테스트
 
@@ -76,7 +75,7 @@ pip install -r requirements-torch-cu128.txt
 ## YOLO 서버 실행
 
 ```bash
-python scripts/run_yolo_server.py
+python scripts/yolo_detection_server.py
 ```
 
 기본 실행 설정은 YOLO 단독 데모 탐지에 맞춰져 있습니다:
@@ -100,7 +99,7 @@ python scripts/run_yolo_server.py
 Windows PowerShell에서 데모용 실행 옵션:
 
 ```powershell
-$env:YOLO_MODEL_PATH="runs/detect/finetune_tankkk2_valfix_30/weights/best.pt"
+$env:YOLO_MODEL_PATH="models/tank_detector/best.pt"
 $env:YOLO_IMGSZ="512"
 $env:YOLO_MODEL_CONF="0.10"
 $env:YOLO_DEFAULT_CONF="0.20"
@@ -115,14 +114,14 @@ $env:YOLO_RECOGNITION_LOG="true"
 $env:YOLO_RECOGNITION_LOG_CACHE="false"
 $env:YOLO_RECOGNITION_LOG_EMPTY="false"
 $env:FLASK_THREADED="false"
-python scripts/run_yolo_server.py
+python scripts/yolo_detection_server.py
 ```
 
 더 빠른 대신 정확도는 낮아질 수 있는 테스트:
 
 ```powershell
 $env:YOLO_IMGSZ="416"
-python scripts/run_yolo_server.py
+python scripts/yolo_detection_server.py
 ```
 
 현재 서버 상태를 확인합니다:
@@ -143,27 +142,27 @@ Invoke-RestMethod http://127.0.0.1:5000/debug_state
 
 ```powershell
 $env:YOLO_RECOGNITION_LOG="false"
-python scripts/run_yolo_server.py
+python scripts/yolo_detection_server.py
 ```
 
 캐시된 탐지 응답도 인식 로그에 포함하려면:
 
 ```powershell
 $env:YOLO_RECOGNITION_LOG_CACHE="true"
-python scripts/run_yolo_server.py
+python scripts/yolo_detection_server.py
 ```
 
 탐지 결과가 비어 있는 경우도 로그로 남기려면:
 
 ```powershell
 $env:YOLO_RECOGNITION_LOG_EMPTY="true"
-python scripts/run_yolo_server.py
+python scripts/yolo_detection_server.py
 ```
 
 디버그용 실행 옵션은 더 무겁지만 탐지 실패 원인을 찾을 때 유용합니다. `YOLO_LOW_CONF_FALLBACK=true`는 결과가 비어 있을 때 YOLO를 한 번 더 실행할 수 있으므로, 문제를 진단하는 상황이 아니라면 데모에서는 꺼두는 편이 좋습니다.
 
 ```powershell
-$env:YOLO_MODEL_PATH="runs/detect/finetune_tankkk2_valfix_30/weights/best.pt"
+$env:YOLO_MODEL_PATH="models/tank_detector/best.pt"
 $env:YOLO_DETECT_CACHE="false"
 $env:YOLO_LOW_CONF_FALLBACK="true"
 $env:YOLO_RETURN_FALLBACK_DETECTIONS="true"
@@ -175,7 +174,7 @@ $env:YOLO_DETECT_DEBUG="true"
 $env:YOLO_TIMING="true"
 $env:YOLO_RECOGNITION_LOG="true"
 $env:FLASK_THREADED="false"
-python scripts/run_yolo_server.py
+python scripts/yolo_detection_server.py
 ```
 
 반환 필터를 완전히 우회하려면 다음 옵션도 추가합니다:
@@ -195,7 +194,7 @@ $env:YOLO_WALL_CONF="0.05"
 - `latestRawDetectionCount=0`: 모델 경로, 모델 품질, 입력 이미지 문제 가능성
 - `latestRawDetectionCount>0`와 `latestReturnedDetectionCount=0`: 반환 임계값 또는 필터 문제 가능성
 - `latestDetectCached=true`: 캐시된 결과가 반환된 상태이므로 `latestCacheReason` 확인
-- `modelPathFromEnv=false`: 서버가 `YOLO_MODEL_PATH`가 아니라 자동 선택된 가중치를 사용한 상태
+- `modelPathFromEnv=false`: 서버가 `YOLO_MODEL_PATH`가 아니라 기본 최종 가중치를 사용한 상태
 - `latestFrameShape`, `latestFrameMean`, `latestFrameStd`: 시뮬레이터 이미지가 정상 디코딩되는지 확인
 - `latestRejectedDetections`: `below_default_threshold` 같은 박스별 필터 제외 이유 확인
 - `latestFallbackUsed=true`: 일반 confidence 탐지에서는 결과가 없었고 low-confidence fallback이 최신 결과를 만든 상태
@@ -206,14 +205,14 @@ $env:YOLO_WALL_CONF="0.05"
 
 ```bash
 export ROBOFLOW_API_KEY=your_key_here
-python scripts/train_yolo_wall_detector.py
+python scripts/train_yolo_detector.py
 ```
 
 Windows PowerShell에서는 다음처럼 설정합니다:
 
 ```powershell
 $env:ROBOFLOW_API_KEY="your_key_here"
-python scripts/train_yolo_wall_detector.py
+python scripts/train_yolo_detector.py
 ```
 
 모델 가중치나 다운로드한 데이터셋은 커밋하지 마세요. 팀에서 학습된 가중치를 공유해야 한다면 Git LFS나 릴리스 아티팩트를 사용하세요.

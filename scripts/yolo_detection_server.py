@@ -26,20 +26,12 @@ import torch
 from ultralytics import YOLO
 import yaml
 
-# 프로젝트 경로, 모델 후보, 탐지 임계값 같은 전역 실행 설정입니다.
+# 프로젝트 경로, 기본 모델, 탐지 임계값 같은 전역 실행 설정입니다.
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 CONFIG_PATH = PROJECT_ROOT / "configs" / "simulator.yaml"
-BASE_MODEL_PATH = PROJECT_ROOT / "runs" / "detect" / "first_yolo11n" / "weights" / "best.pt"
-# 최근에 학습한 모델을 우선 사용하고, 없으면 기본 모델로 내려갑니다.
-# `YOLO_MODEL_PATH` 환경변수를 주면 이 후보 목록보다 환경변수가 우선합니다.
-FINETUNED_MODEL_PATHS = [
-    PROJECT_ROOT / "runs" / "detect" / "finetune_tankkk2_focus_150" / "weights" / "best.pt",
-    PROJECT_ROOT / "runs" / "detect" / "finetune_tankkk2_focus_continue_150" / "weights" / "best.pt",
-    PROJECT_ROOT / "runs" / "detect" / "finetune_tankkk2_valfix_30" / "weights" / "best.pt",
-    PROJECT_ROOT / "runs" / "detect" / "finetune_tankkk2-2" / "weights" / "best.pt",
-    PROJECT_ROOT / "runs" / "detect" / "finetune_tankkk2" / "weights" / "best.pt",
-]
+DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "tank_detector" / "best.pt"
+# `YOLO_MODEL_PATH` 환경변수를 주면 기본 모델 대신 해당 weight를 사용합니다.
 CLASS_ALIASES = {
     "blue": "person",
     "red": "person",
@@ -192,19 +184,20 @@ def make_warmup_image():
 
 
 def resolve_model_path():
-    """환경변수, 파인튜닝 후보, 기본 모델 순서로 사용할 weight 파일을 선택합니다."""
+    """환경변수가 있으면 해당 weight를, 없으면 정해진 최종 weight 파일을 선택합니다."""
     if YOLO_MODEL_PATH_ENV:
         path = Path(YOLO_MODEL_PATH_ENV)
         return path if path.is_absolute() else PROJECT_ROOT / path
-    for model_path in FINETUNED_MODEL_PATHS:
-        if model_path.exists():
-            return model_path
-    return BASE_MODEL_PATH
+    return DEFAULT_MODEL_PATH
 
 
 def get_model_path_candidates():
-    """디버그 화면에서 어떤 모델 후보가 존재하는지 확인할 수 있도록 목록을 만듭니다."""
-    candidates = [*FINETUNED_MODEL_PATHS, BASE_MODEL_PATH]
+    """디버그 화면에서 현재 사용할 모델 경로가 존재하는지 확인할 수 있도록 목록을 만듭니다."""
+    candidates = []
+    if YOLO_MODEL_PATH_ENV:
+        env_path = Path(YOLO_MODEL_PATH_ENV)
+        candidates.append(env_path if env_path.is_absolute() else PROJECT_ROOT / env_path)
+    candidates.append(DEFAULT_MODEL_PATH)
     return [
         {
             "path": str(path),

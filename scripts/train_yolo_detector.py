@@ -25,7 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # 결과물과 입력 데이터셋의 기본 위치입니다. CLI 인자로 모두 덮어쓸 수 있습니다.
 DEFAULT_WORKSPACE = PROJECT_ROOT / "data" / "yolo_wall_finetune"
 DEFAULT_BASE_DATASET = PROJECT_ROOT / "data" / "base_tank_dataset"
-DEFAULT_BEST_PT = PROJECT_ROOT / "runs" / "detect" / "first_yolo11n" / "weights" / "best.pt"
+DEFAULT_BEST_PT = PROJECT_ROOT / "models" / "tank_detector" / "best.pt"
 DEFAULT_PROJECT_DIR = PROJECT_ROOT / "runs" / "detect"
 DEFAULT_ROBOFLOW_API_KEY = ""
 DEFAULT_EPOCHS = 150
@@ -110,7 +110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--close-mosaic", type=int, default=15)
     parser.add_argument("--val-iou", type=float, default=0.75)
     parser.add_argument("--project-dir", type=Path, default=DEFAULT_PROJECT_DIR)
-    parser.add_argument("--name", default="finetune_tankkk2")
+    parser.add_argument("--name", default="tank_detector_finetune")
     parser.add_argument("--build-only", action="store_true")
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--skip-val", action="store_true")

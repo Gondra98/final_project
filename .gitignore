@@ -18,7 +18,6 @@ logs/
 *.mp4
 *.zip
 *.csv
-models/
 runs/
 
 # Downloaded/generated datasets
