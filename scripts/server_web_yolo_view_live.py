@@ -1,6 +1,10 @@
 """
 Tank simulator -> Flask -> Web live view + async YOLO(best.pt)
 
+이 파일은 디버깅/시각화에 초점을 둔 서버다.
+`run_yolo_server.py`처럼 `/detect`를 제공하지만, 탐지는 백그라운드 worker가 처리하고
+웹 페이지(`/view`)는 최신 프레임 위에 마지막 bbox를 덧그려 보여준다.
+
 핵심 구조
 - /detect: 시뮬레이터 이미지 수신 후 원본 프레임을 즉시 latest_frame에 저장하고 바로 최신 detection을 반환
 - yolo_worker: 백그라운드에서 최신 프레임 1장만 YOLO 추론
@@ -28,6 +32,7 @@ from ultralytics import YOLO
 # =========================
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL_PATH = SCRIPT_DIR / "best.pt"
+# 웹 확인용 서버는 기본적으로 scripts/best.pt를 사용하지만, YOLO_MODEL_PATH로 다른 weight를 지정할 수 있습니다.
 YOLO_MODEL_PATH = Path(os.getenv("YOLO_MODEL_PATH", str(DEFAULT_MODEL_PATH)))
 if not YOLO_MODEL_PATH.is_absolute():
     YOLO_MODEL_PATH = (SCRIPT_DIR / YOLO_MODEL_PATH).resolve()
@@ -37,6 +42,7 @@ PORT = int(os.getenv("SERVER_PORT", "5000"))
 
 YOLO_DEVICE = os.getenv("YOLO_DEVICE", "0" if torch.cuda.is_available() else "cpu")
 USE_CUDA = torch.cuda.is_available() and YOLO_DEVICE.lower() != "cpu"
+# half precision은 CUDA에서만 의미가 있으므로 CPU 실행일 때는 자동으로 꺼집니다.
 YOLO_HALF = os.getenv("YOLO_HALF", "true").lower() in {"1", "true", "yes", "on"} and USE_CUDA
 YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "416"))
 YOLO_CONF = float(os.getenv("YOLO_CONF", "0.20"))
@@ -76,6 +82,7 @@ print(
 # 공유 상태
 # =========================
 state_lock = Lock()
+# worker가 새 프레임을 기다릴 때 쓰는 조건 변수입니다. busy-wait 없이 `/detect`가 깨워줍니다.
 frame_condition = Condition()
 
 latest_frame: Optional[np.ndarray] = None          # 웹에 즉시 보여줄 최신 원본 프레임
@@ -99,6 +106,7 @@ worker_count: int = 0
 # 유틸 함수
 # =========================
 def decode_uploaded_image(image_file) -> Optional[np.ndarray]:
+    """Flask 업로드 파일을 OpenCV BGR 프레임으로 디코딩합니다."""
     image_bytes = image_file.read()
     if not image_bytes:
         return None
@@ -107,7 +115,11 @@ def decode_uploaded_image(image_file) -> Optional[np.ndarray]:
 
 
 def run_yolo_only(frame: np.ndarray) -> Tuple[List[Dict[str, Any]], float, float]:
-    """YOLO 추론 후 bbox 결과만 반환. 웹용 이미지는 매번 별도로 그림."""
+    """YOLO 추론 후 bbox 결과와 소요 시간을 반환합니다.
+
+    화면에 그릴 이미지는 여기서 만들지 않습니다. worker는 숫자 결과만 저장하고,
+    스트리밍 루프가 최신 원본 프레임에 bbox를 덧그려 웹 응답을 만듭니다.
+    """
     yolo_started = time.perf_counter()
     with torch.inference_mode():
         results = model.predict(
@@ -149,6 +161,7 @@ def run_yolo_only(frame: np.ndarray) -> Tuple[List[Dict[str, Any]], float, float
 
 
 def draw_detections(frame: np.ndarray, detections: List[Dict[str, Any]]) -> np.ndarray:
+    """프레임 복사본에 bbox와 현재 처리 상태 텍스트를 덧그립니다."""
     drawn = frame.copy()
     for det in detections:
         bbox = det.get("bbox", [])
@@ -187,6 +200,7 @@ def draw_detections(frame: np.ndarray, detections: List[Dict[str, Any]]) -> np.n
 
 
 def make_blank_frame(message: str = "Waiting for simulator image...") -> np.ndarray:
+    """아직 `/detect`가 들어오지 않았을 때 웹 스트림에 보여줄 대기 화면입니다."""
     frame = np.zeros((480, 854, 3), dtype=np.uint8)
     cv2.putText(frame, message, (40, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
     return frame
@@ -195,6 +209,7 @@ def make_blank_frame(message: str = "Waiting for simulator image...") -> np.ndar
 # YOLO 백그라운드 worker
 # =========================
 def yolo_worker_loop() -> None:
+    """새 프레임이 들어올 때마다 가장 최신 프레임 하나만 YOLO로 처리하는 worker입니다."""
     global processed_frame_seq, latest_detections, latest_yolo_ms, latest_post_ms
     global latest_worker_total_ms, latest_result_timestamp, latest_error, worker_count
 
@@ -206,6 +221,7 @@ def yolo_worker_loop() -> None:
             frame_condition.wait_for(lambda: latest_frame_seq > processed_frame_seq)
 
         # 최신 프레임만 복사한다. 중간에 쌓인 오래된 프레임은 버린다.
+        # 이 방식은 모든 프레임을 처리하는 정확도보다 화면/시뮬레이터 응답성을 우선합니다.
         with state_lock:
             frame = None if latest_frame is None else latest_frame.copy()
             seq_to_process = latest_frame_seq
@@ -226,6 +242,7 @@ def yolo_worker_loop() -> None:
             detections, yolo_ms, post_ms = run_yolo_only(frame)
             total_ms = (time.perf_counter() - started) * 1000
             with state_lock:
+                # worker 결과는 한 번에 갱신해서 `/detect`, `/view`, `/debug_state`가 일관된 값을 읽게 합니다.
                 processed_frame_seq = seq_to_process
                 latest_detections = list(detections)
                 latest_yolo_ms = yolo_ms
@@ -288,6 +305,7 @@ def detect():
         latest_decode_ms = decode_ms
         detections_to_return = list(latest_detections)  # 직전 최신 결과
 
+    # worker가 잠들어 있으면 깨우지만, 응답은 worker 완료를 기다리지 않고 즉시 보냅니다.
     with frame_condition:
         frame_condition.notify()
 
@@ -310,6 +328,7 @@ def detect():
 
 @app.route("/init", methods=["GET"])
 def init():
+    """시뮬레이터 시작 시 필요한 초기 설정을 반환합니다."""
     config = {
         "startMode": "start",
         "blStartX": 60,
@@ -335,11 +354,13 @@ def init():
 
 @app.route("/info", methods=["POST"])
 def info():
+    """시뮬레이터 상태 tick에 대해 별도 제어 없이 정상 응답만 반환합니다."""
     return jsonify({"status": "success", "control": ""})
 
 
 @app.route("/get_action", methods=["POST"])
 def get_action():
+    """웹 확인용 서버에서는 이동 제어를 하지 않고 중립 명령을 보냅니다."""
     command = {
         "moveWS": {"command": "", "weight": 0.0},
         "moveAD": {"command": "", "weight": 0.0},
@@ -354,6 +375,7 @@ def get_action():
 # =========================
 @app.route("/view")
 def view():
+    """브라우저에서 확인할 수 있는 단일 페이지를 문자열 템플릿으로 제공합니다."""
     html = """
     <!doctype html>
     <html lang="ko">
@@ -383,6 +405,7 @@ def view():
 
 
 def generate_video_stream():
+    """MJPEG 스트림을 생성합니다. 브라우저는 각 JPEG 조각을 이어서 영상처럼 표시합니다."""
     interval = 1.0 / max(1.0, WEB_FPS)
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
 
@@ -394,6 +417,7 @@ def generate_video_stream():
         if frame is None:
             frame = make_blank_frame()
         else:
+            # worker 결과가 약간 이전 프레임 기준일 수 있지만, 실시간 디버깅에서는 지연을 줄이는 것이 더 중요합니다.
             frame = draw_detections(frame, detections)
 
         ok, buffer = cv2.imencode(".jpg", frame, encode_params)
@@ -407,11 +431,13 @@ def generate_video_stream():
 
 @app.route("/video_feed")
 def video_feed():
+    """`/view`의 img 태그가 구독하는 MJPEG 응답입니다."""
     return Response(generate_video_stream(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
 @app.route("/debug_state")
 def debug_state():
+    """프레임 수신, worker 처리, 최근 에러와 성능 값을 JSON으로 확인합니다."""
     with state_lock:
         result_age = time.time() - latest_result_timestamp if latest_result_timestamp else None
         frame_age = time.time() - latest_frame_timestamp if latest_frame_timestamp else None
@@ -447,6 +473,7 @@ def debug_state():
 # Warm-up
 # =========================
 def warmup_yolo() -> None:
+    """첫 실제 요청에서 생기는 CUDA/모델 초기화 지연을 줄이기 위해 더미 추론을 미리 실행합니다."""
     if not YOLO_MODEL_PATH.exists():
         return
     dummy = np.zeros((YOLO_IMGSZ, YOLO_IMGSZ, 3), dtype=np.uint8)
@@ -472,6 +499,7 @@ def warmup_yolo() -> None:
 
 
 if __name__ == "__main__":
+    # 서버 시작 전에 모델을 한 번 깨우고, 이후에는 데몬 worker가 최신 프레임만 계속 처리합니다.
     warmup_yolo()
     Thread(target=yolo_worker_loop, daemon=True).start()
     print(f"Server running: http://127.0.0.1:{PORT}/view")

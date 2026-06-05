@@ -1,3 +1,14 @@
+"""
+YOLO 벽/장애물 탐지 모델을 파인튜닝하기 위한 데이터셋 준비 및 학습 스크립트.
+
+큰 흐름:
+1. 기존 탱크 데이터셋과 Roboflow에서 받은 tent/wall 데이터셋을 하나의 YOLO 데이터셋으로 합친다.
+2. 서로 다른 라벨 이름과 class id를 FINAL_CLASSES 기준으로 재매핑한다.
+3. 검증셋에 클래스별 최소 박스 수가 부족하면 train 샘플 일부를 valid로 옮긴다.
+4. wall 같은 집중 학습 클래스는 train에서 복사본을 만들어 조금 더 자주 보이게 한다.
+5. 기존 best.pt를 시작점으로 Ultralytics YOLO 파인튜닝을 실행한다.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -11,6 +22,7 @@ from collections import Counter
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+# 결과물과 입력 데이터셋의 기본 위치입니다. CLI 인자로 모두 덮어쓸 수 있습니다.
 DEFAULT_WORKSPACE = PROJECT_ROOT / "data" / "yolo_wall_finetune"
 DEFAULT_BASE_DATASET = PROJECT_ROOT / "data" / "base_tank_dataset"
 DEFAULT_BEST_PT = PROJECT_ROOT / "runs" / "detect" / "first_yolo11n" / "weights" / "best.pt"
@@ -18,11 +30,14 @@ DEFAULT_PROJECT_DIR = PROJECT_ROOT / "runs" / "detect"
 DEFAULT_ROBOFLOW_API_KEY = ""
 DEFAULT_EPOCHS = 150
 
+# Roboflow export API에서 다운로드할 프로젝트 정보입니다.
 ROBOFLOW_WORKSPACE = "has-workspace-3feui"
 ROBOFLOW_PROJECT = "tankkk2"
 ROBOFLOW_VERSION = 1
 ROBOFLOW_FORMAT = "yolov11"
 
+# base 데이터셋과 Roboflow 데이터셋의 라벨을 최종 5개 클래스로 통합합니다.
+# 예: blue/red 사람 라벨은 person으로 합치고, car는 현재 목표에서 제외합니다.
 BASE_CLASSES = ["blue", "car", "red", "rock", "tank"]
 FINAL_CLASSES = ["rock", "Tank", "person", "tent", "wall"]
 CLASS_ALIASES = {
@@ -40,6 +55,8 @@ IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".webp"}
 
 @dataclass
 class CopyStats:
+    """split 복사 중 처리한 이미지/라벨/박스 수를 집계합니다."""
+
     images: int = 0
     labels: int = 0
     boxes: int = 0
@@ -48,17 +65,22 @@ class CopyStats:
 
 @dataclass
 class SplitMoveStats:
+    """검증셋 보강을 위해 train에서 valid로 옮긴 샘플 수를 집계합니다."""
+
     images: int = 0
     boxes: int = 0
 
 
 @dataclass
 class DuplicateStats:
+    """집중 클래스 오버샘플링으로 복제한 train 샘플 수를 집계합니다."""
+
     images: int = 0
     boxes: int = 0
 
 
 def parse_args() -> argparse.Namespace:
+    """데이터셋 준비와 학습 하이퍼파라미터를 CLI에서 받습니다."""
     parser = argparse.ArgumentParser(
         description="Download Roboflow tankkk2 and fine-tune YOLO with tent/wall data."
     )
@@ -127,6 +149,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def read_yaml(path: Path) -> dict:
+    """YOLO data.yaml을 읽습니다. PyYAML이 없으면 설치 안내와 함께 종료합니다."""
     try:
         import yaml
     except ModuleNotFoundError as exc:
@@ -137,6 +160,7 @@ def read_yaml(path: Path) -> dict:
 
 
 def normalize_names(names: object) -> list[str]:
+    """data.yaml의 names가 dict/list 어느 형식이든 class id 순서의 list로 변환합니다."""
     if isinstance(names, dict):
         return [str(names[key]) for key in sorted(names, key=lambda value: int(value))]
     if isinstance(names, list):
@@ -145,6 +169,7 @@ def normalize_names(names: object) -> list[str]:
 
 
 def resolve_images_dir(dataset_root: Path, data_yaml: dict, output_split: str) -> Path | None:
+    """data.yaml 경로 설정과 일반 YOLO 폴더 구조를 모두 고려해 이미지 폴더를 찾습니다."""
     yaml_key = "val" if output_split == "valid" else output_split
     yaml_value = data_yaml.get(yaml_key)
     candidates: list[Path] = []
@@ -171,12 +196,14 @@ def resolve_images_dir(dataset_root: Path, data_yaml: dict, output_split: str) -
 
 
 def labels_dir_for(images_dir: Path) -> Path:
+    """이미지 폴더에 대응되는 labels 폴더를 추정합니다."""
     if images_dir.name == "images":
         return images_dir.parent / "labels"
     return images_dir.with_name("labels")
 
 
 def iter_images(images_dir: Path | None) -> list[Path]:
+    """지원하는 이미지 확장자만 정렬해서 반환합니다."""
     if images_dir is None or not images_dir.exists():
         return []
     return sorted(
@@ -187,12 +214,14 @@ def iter_images(images_dir: Path | None) -> list[Path]:
 
 
 def reset_dir(path: Path) -> None:
+    """출력 폴더를 깨끗하게 비운 뒤 다시 만듭니다."""
     if path.exists():
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
 
 
 def canonical_class_name(source_name: str) -> str | None:
+    """원본 라벨명을 최종 라벨명으로 바꿉니다. None은 학습에서 제외할 클래스를 뜻합니다."""
     normalized = source_name.strip().lower()
     if normalized in IGNORED_SOURCE_CLASSES:
         return None
@@ -205,6 +234,7 @@ def canonical_class_name(source_name: str) -> str | None:
 
 
 def build_class_id_map(source_names: list[str]) -> dict[int, int | None]:
+    """원본 class id를 최종 class id로 바꾸는 매핑표를 만듭니다."""
     class_id_map: dict[int, int | None] = {}
     for source_id, source_name in enumerate(source_names):
         canonical_name = canonical_class_name(source_name)
@@ -213,6 +243,7 @@ def build_class_id_map(source_names: list[str]) -> dict[int, int | None]:
 
 
 def remap_label_line(line: str, source_label: Path, class_id_map: dict[int, int | None]) -> str | None:
+    """YOLO 라벨 한 줄을 최종 class id와 detection bbox 형식으로 변환합니다."""
     stripped = line.strip()
     if not stripped:
         return None
@@ -233,6 +264,7 @@ def remap_label_line(line: str, source_label: Path, class_id_map: dict[int, int 
 
 
 def to_detection_box(coords: list[str], source_label: Path) -> list[str]:
+    """bbox 라벨과 polygon/segment 라벨을 모두 YOLO detection bbox로 변환합니다."""
     if len(coords) == 4:
         x_center, y_center, width, height = (float(value) for value in coords)
         x_min = x_center - width / 2
@@ -241,6 +273,7 @@ def to_detection_box(coords: list[str], source_label: Path) -> list[str]:
         y_max = y_center + height / 2
         return corners_to_yolo_box(x_min, y_min, x_max, y_max)
 
+    # polygon segmentation 라벨은 모든 점을 감싸는 외접 bbox로 단순화합니다.
     values = [float(value) for value in coords]
     if len(values) < 6 or len(values) % 2 != 0:
         raise ValueError(f"Invalid detection/segment coordinates in {source_label}: {coords!r}")
@@ -251,6 +284,8 @@ def to_detection_box(coords: list[str], source_label: Path) -> list[str]:
 
 
 def corners_to_yolo_box(x_min: float, y_min: float, x_max: float, y_max: float) -> list[str]:
+    """corner 좌표를 YOLO의 normalized center-width-height 형식으로 바꿉니다."""
+    # 잘못된 annotation이 들어와도 학습이 깨지지 않도록 0~1 범위로 clamp합니다.
     x_min = max(0.0, min(1.0, x_min))
     y_min = max(0.0, min(1.0, y_min))
     x_max = max(0.0, min(1.0, x_max))
@@ -279,6 +314,7 @@ def copy_split(
     prefix: str,
     class_id_map: dict[int, int | None],
 ) -> CopyStats:
+    """하나의 split(train/valid/test)을 출력 데이터셋으로 복사하며 라벨 id를 재매핑합니다."""
     images_dir = resolve_images_dir(source_root, source_data_yaml, output_split)
     source_labels_dir = labels_dir_for(images_dir) if images_dir else None
     output_images_dir = output_root / output_split / "images"
@@ -288,6 +324,7 @@ def copy_split(
 
     stats = CopyStats()
     for image_path in iter_images(images_dir):
+        # 서로 다른 데이터셋에 같은 파일명이 있어도 충돌하지 않도록 prefix와 split을 stem에 붙입니다.
         output_stem = f"{prefix}_{output_split}_{image_path.stem}"
         output_image_path = output_images_dir / f"{output_stem}{image_path.suffix.lower()}"
         output_label_path = output_labels_dir / f"{output_stem}.txt"
@@ -301,6 +338,7 @@ def copy_split(
             for line in source_label_path.read_text(encoding="utf-8").splitlines():
                 remapped = remap_label_line(line, source_label_path, class_id_map)
                 if remapped is None:
+                    # car처럼 제외 대상인 클래스는 label 파일에는 쓰지 않고 통계만 남깁니다.
                     if line.strip():
                         stats.ignored_boxes += 1
                     continue
@@ -318,6 +356,7 @@ def copy_split(
 
 
 def dedupe_label_lines(label_lines: list[str]) -> list[str]:
+    """같은 이미지에 완전히 동일한 bbox 라인이 중복되면 한 번만 남깁니다."""
     seen: set[str] = set()
     deduped: list[str] = []
     for line in label_lines:
@@ -329,6 +368,7 @@ def dedupe_label_lines(label_lines: list[str]) -> list[str]:
 
 
 def write_combined_yaml(output_root: Path, class_names: list[str]) -> Path:
+    """합쳐진 데이터셋을 Ultralytics가 읽을 수 있는 data.yaml로 저장합니다."""
     data_yaml = output_root / "data.yaml"
     names_yaml = "\n".join(f"  - {name}" for name in class_names)
     data_yaml.write_text(
@@ -350,6 +390,7 @@ def write_combined_yaml(output_root: Path, class_names: list[str]) -> Path:
 
 
 def label_counts(label_path: Path) -> Counter[int]:
+    """라벨 파일 하나에 들어 있는 class id별 bbox 개수를 셉니다."""
     counts: Counter[int] = Counter()
     if not label_path.exists():
         return counts
@@ -361,6 +402,7 @@ def label_counts(label_path: Path) -> Counter[int]:
 
 
 def split_counts(dataset_root: Path, split: str) -> Counter[int]:
+    """split 전체의 class id별 bbox 개수를 합산합니다."""
     counts: Counter[int] = Counter()
     labels_dir = dataset_root / split / "labels"
     if not labels_dir.exists():
@@ -371,6 +413,7 @@ def split_counts(dataset_root: Path, split: str) -> Counter[int]:
 
 
 def find_matching_image(images_dir: Path, stem: str) -> Path | None:
+    """라벨 stem과 같은 이름의 이미지 파일을 지원 확장자 범위에서 찾습니다."""
     for extension in IMAGE_EXTENSIONS:
         candidate = images_dir / f"{stem}{extension}"
         if candidate.exists():
@@ -379,6 +422,7 @@ def find_matching_image(images_dir: Path, stem: str) -> Path | None:
 
 
 def move_train_sample_to_valid(dataset_root: Path, label_path: Path) -> int:
+    """검증셋 보강을 위해 train 이미지/라벨 한 쌍을 valid로 이동합니다."""
     train_images_dir = dataset_root / "train" / "images"
     train_labels_dir = dataset_root / "train" / "labels"
     valid_images_dir = dataset_root / "valid" / "images"
@@ -394,6 +438,7 @@ def move_train_sample_to_valid(dataset_root: Path, label_path: Path) -> int:
     shutil.move(str(image_path), str(valid_images_dir / image_path.name))
     shutil.move(str(label_path), str(valid_labels_dir / label_path.name))
 
+    # 일부 환경에서 label만 남는 경우를 방지하기 위한 정리 코드입니다.
     empty_train_label = train_labels_dir / label_path.name
     if empty_train_label.exists():
         empty_train_label.unlink()
@@ -405,6 +450,7 @@ def ensure_validation_coverage(
     class_names: list[str],
     min_boxes_per_class: int,
 ) -> SplitMoveStats:
+    """valid split에 클래스별 최소 박스 수가 없으면 train 샘플을 옮겨 분포를 보강합니다."""
     if min_boxes_per_class <= 0:
         return SplitMoveStats()
 
@@ -430,6 +476,7 @@ def ensure_validation_coverage(
         for _, label_path in train_candidates:
             if not label_path.exists():
                 continue
+            # 한 이미지에 같은 클래스 박스가 많은 샘플부터 옮겨 목표 박스 수를 빠르게 채웁니다.
             moved_counts = label_counts(label_path)
             moved_boxes = move_train_sample_to_valid(dataset_root, label_path)
             valid_counts.update(moved_counts)
@@ -451,6 +498,7 @@ def ensure_validation_coverage(
 
 
 def print_split_distribution(dataset_root: Path, class_names: list[str]) -> None:
+    """train/valid/test의 클래스 분포를 콘솔에 출력해 데이터 불균형을 바로 확인합니다."""
     for split in ("train", "valid", "test"):
         counts = split_counts(dataset_root, split)
         total = sum(counts.values())
@@ -459,6 +507,7 @@ def print_split_distribution(dataset_root: Path, class_names: list[str]) -> None
 
 
 def class_ids_for_names(class_names: list[str], selected_names: list[str]) -> set[int]:
+    """CLI로 받은 클래스 이름 목록을 실제 class id set으로 변환합니다."""
     normalized_to_id = {name.lower(): class_id for class_id, name in enumerate(class_names)}
     class_ids: set[int] = set()
     for selected_name in selected_names:
@@ -479,6 +528,7 @@ def duplicate_train_samples(
     contrast_classes: list[str],
     contrast_ratio: float,
 ) -> DuplicateStats:
+    """집중 클래스 샘플을 복제하고, 비교 대상 클래스도 일부 복제해 과도한 편향을 줄입니다."""
     if focus_copy_factor <= 0:
         return DuplicateStats()
 
@@ -500,6 +550,7 @@ def duplicate_train_samples(
         if has_focus:
             focus_label_paths.append(label_path)
         elif has_contrast:
+            # focus가 없는 contrast 샘플만 따로 모아 벽/바위 구분에 필요한 음성 예시로 사용합니다.
             contrast_label_paths.append(label_path)
 
     stats = DuplicateStats()
@@ -538,6 +589,7 @@ def duplicate_train_sample(
     label_path: Path,
     prefix: str,
 ) -> int:
+    """train 이미지/라벨 한 쌍을 새 stem으로 복사하고 포함된 bbox 수를 반환합니다."""
     image_path = find_matching_image(train_images_dir, label_path.stem)
     if image_path is None:
         raise FileNotFoundError(f"Image for label not found: {label_path}")
@@ -549,6 +601,7 @@ def duplicate_train_sample(
 
 
 def download_roboflow_dataset(api_key: str, download_dir: Path) -> Path:
+    """Roboflow export API에서 zip을 내려받아 압축을 풀고 data.yaml 위치를 반환합니다."""
     if not api_key:
         raise SystemExit(
             "ROBOFLOW_API_KEY is not set. Set it first, or pass --api-key."
@@ -568,6 +621,7 @@ def download_roboflow_dataset(api_key: str, download_dir: Path) -> Path:
     if not download_url:
         raise RuntimeError(f"Roboflow export link not found in response: {payload}")
 
+    # 다운로드 폴더는 매번 새로 만들어 이전 export가 섞이지 않게 합니다.
     if download_dir.exists():
         shutil.rmtree(download_dir)
     download_dir.mkdir(parents=True, exist_ok=True)
@@ -587,6 +641,7 @@ def download_roboflow_dataset(api_key: str, download_dir: Path) -> Path:
 
 
 def find_dataset_root(path: Path) -> Path:
+    """압축 해제 결과 안에서 실제 YOLO dataset root(data.yaml이 있는 폴더)를 찾습니다."""
     data_yaml_files = sorted(path.rglob("data.yaml"))
     if not data_yaml_files:
         raise FileNotFoundError(f"data.yaml not found under {path}")
@@ -594,6 +649,7 @@ def find_dataset_root(path: Path) -> Path:
 
 
 def build_combined_dataset(args: argparse.Namespace) -> tuple[Path, list[str]]:
+    """base 데이터셋과 Roboflow 데이터셋을 병합하고 학습 가능한 data.yaml을 만듭니다."""
     workspace = args.workspace.resolve()
     download_dir = workspace / "roboflow_download"
     combined_dir = workspace / "combined"
@@ -618,6 +674,7 @@ def build_combined_dataset(args: argparse.Namespace) -> tuple[Path, list[str]]:
     new_names = normalize_names(new_yaml.get("names"))
     class_names = [*FINAL_CLASSES]
 
+    # 각 데이터셋의 class id 체계가 다르므로 복사 전에 최종 class id 매핑을 따로 만듭니다.
     base_map = build_class_id_map(base_names)
     new_map = build_class_id_map(new_names)
 
@@ -649,6 +706,7 @@ def build_combined_dataset(args: argparse.Namespace) -> tuple[Path, list[str]]:
 
 
 def resolve_best_pt(path: Path) -> Path:
+    """파인튜닝 시작점으로 사용할 best.pt가 실제로 있는지 검증합니다."""
     best_pt = path.resolve()
     if not best_pt.exists():
         raise FileNotFoundError(
@@ -661,6 +719,7 @@ def resolve_best_pt(path: Path) -> Path:
 
 
 def fine_tune(args: argparse.Namespace, data_yaml: Path) -> Path:
+    """준비된 data.yaml과 기존 best.pt를 사용해 Ultralytics YOLO 학습을 실행합니다."""
     from ultralytics import YOLO
 
     best_pt = resolve_best_pt(args.best_pt)
@@ -690,6 +749,7 @@ def fine_tune(args: argparse.Namespace, data_yaml: Path) -> Path:
     best_weights = save_dir / "weights" / "best.pt"
 
     if not args.skip_val:
+        # 학습 직후 같은 data.yaml로 한 번 더 검증해 best.pt 성능 로그를 남깁니다.
         val_model = YOLO(str(best_weights))
         val_model.val(data=str(data_yaml), device=args.device)
 
@@ -700,7 +760,9 @@ def fine_tune(args: argparse.Namespace, data_yaml: Path) -> Path:
 
 
 def main() -> None:
+    """데이터셋을 만든 뒤, build-only가 아니면 바로 파인튜닝까지 실행합니다."""
     args = parse_args()
+    # Windows/OpenMP 조합에서 중복 런타임 경고로 종료되는 문제를 피하기 위한 기본값입니다.
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
     data_yaml, _ = build_combined_dataset(args)
 

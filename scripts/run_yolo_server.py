@@ -1,6 +1,11 @@
 """
 Tank 시뮬레이터와 YOLO 모델을 연결하는 Flask 서버.
 
+주 사용처:
+- 시뮬레이터가 detectMode로 실행될 때 이미지 프레임을 받아 객체 탐지를 수행한다.
+- 탐지 결과를 시뮬레이터 API가 요구하는 `className`, `bbox`, `confidence` 형태로 맞춰준다.
+- 단순 탐지뿐 아니라 초기 설정(`/init`)과 테스트용 이동 명령(`/get_action`)도 함께 제공한다.
+
 큰 흐름:
 1. 환경변수와 `configs/simulator.yaml`에서 실행 설정을 읽는다.
 2. 사용할 YOLO `best.pt` 모델을 고르고 서버 시작 시 한 번 로드한다.
@@ -26,6 +31,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 CONFIG_PATH = PROJECT_ROOT / "configs" / "simulator.yaml"
 BASE_MODEL_PATH = PROJECT_ROOT / "runs" / "detect" / "first_yolo11n" / "weights" / "best.pt"
+# 최근에 학습한 모델을 우선 사용하고, 없으면 기본 모델로 내려갑니다.
+# `YOLO_MODEL_PATH` 환경변수를 주면 이 후보 목록보다 환경변수가 우선합니다.
 FINETUNED_MODEL_PATHS = [
     PROJECT_ROOT / "runs" / "detect" / "finetune_tankkk2_focus_150" / "weights" / "best.pt",
     PROJECT_ROOT / "runs" / "detect" / "finetune_tankkk2_focus_continue_150" / "weights" / "best.pt",
@@ -38,10 +45,15 @@ CLASS_ALIASES = {
     "red": "person",
     "tank": "tank",
 }
+# 학습 데이터에는 남아 있어도 시뮬레이터 제어에는 쓰지 않는 클래스입니다.
 IGNORED_CLASSES = {"car"}
+
+# 모델 입력 단계의 confidence와 응답 반환 단계의 confidence를 분리했습니다.
+# 낮은 모델 confidence는 후보를 넓게 잡기 위한 값이고, DEFAULT_CONFIDENCE_THRESHOLD가 실제 반환 필터입니다.
 MODEL_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_MODEL_CONF", "0.10"))
 FALLBACK_MODEL_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_FALLBACK_MODEL_CONF", "0.05"))
 DEFAULT_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_DEFAULT_CONF", "0.20"))
+# 벽은 가까이 있을 때 박스가 크게 잡히므로 일반 객체보다 낮은 confidence도 허용합니다.
 CLOSE_WALL_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_CLOSE_WALL_CONF", "0.12"))
 CLOSE_WALL_AREA_RATIO = float(os.getenv("YOLO_CLOSE_WALL_AREA_RATIO", "0.08"))
 CLOSE_WALL_MIN_HEIGHT_RATIO = float(os.getenv("YOLO_CLOSE_WALL_MIN_HEIGHT_RATIO", "0.35"))
@@ -52,12 +64,14 @@ DEBUG_DETECTION_LIMIT = int(os.getenv("YOLO_DEBUG_DET_LIMIT", "10"))
 
 
 def env_flag(name, default=False):
+    """환경변수 문자열을 bool로 해석합니다. 값이 없으면 호출자가 준 기본값을 사용합니다."""
     value = os.getenv(name)
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+# CUDA가 있으면 기본적으로 GPU 0번을 사용하고, 명시적으로 cpu를 지정하면 CPU로 고정합니다.
 YOLO_DEVICE = os.getenv("YOLO_DEVICE", "0" if torch.cuda.is_available() else "cpu")
 USE_CUDA_DEVICE = torch.cuda.is_available() and YOLO_DEVICE.lower() != "cpu"
 YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "512"))
@@ -68,9 +82,11 @@ YOLO_RECOGNITION_LOG = env_flag("YOLO_RECOGNITION_LOG", True)
 YOLO_RECOGNITION_LOG_CACHE = env_flag("YOLO_RECOGNITION_LOG_CACHE", False)
 YOLO_RECOGNITION_LOG_EMPTY = env_flag("YOLO_RECOGNITION_LOG_EMPTY", False)
 YOLO_WARMUP_RUNS = int(os.getenv("YOLO_WARMUP_RUNS", "2"))
+# 짧은 시간 안에 중복 요청이 오면 마지막 결과를 재사용해서 시뮬레이터 프레임 드롭을 줄입니다.
 ENABLE_DETECT_CACHE = env_flag("YOLO_DETECT_CACHE", True)
 YOLO_MIN_INTERVAL = float(os.getenv("YOLO_MIN_INTERVAL", "0.12"))
 YOLO_BYPASS_RETURN_FILTER = env_flag("YOLO_BYPASS_RETURN_FILTER", False)
+# 아무 후보도 없을 때만 낮은 confidence로 한 번 더 추론하는 디버그/실험용 옵션입니다.
 YOLO_LOW_CONF_FALLBACK = env_flag("YOLO_LOW_CONF_FALLBACK", False)
 YOLO_RETURN_FALLBACK_DETECTIONS = env_flag("YOLO_RETURN_FALLBACK_DETECTIONS", True)
 DETECT_MODE = env_flag("SIM_DETECT_MODE", True)
@@ -83,17 +99,20 @@ if USE_CUDA_DEVICE:
 
 # 설정 로드, 라벨 정리, 박스 검증처럼 여러 단계에서 공유하는 유틸 함수들입니다.
 def load_config(path=CONFIG_PATH):
+    """시뮬레이터 host/port 같은 실행 설정을 YAML에서 읽습니다."""
     with Path(path).open("r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 def normalize_model_names(names):
+    """Ultralytics가 dict/list 어느 형태로 주든 class id -> 이름 dict로 통일합니다."""
     if isinstance(names, dict):
         return {int(class_id): str(name) for class_id, name in names.items()}
     return {class_id: str(name) for class_id, name in enumerate(names)}
 
 
 def normalize_public_class_name(class_name):
+    """학습 라벨명을 시뮬레이터에 노출할 공개 라벨명으로 변환합니다."""
     class_name = str(class_name).strip().lower()
     return CLASS_ALIASES.get(class_name, class_name)
 
@@ -113,6 +132,7 @@ def get_public_model_names():
 
 
 def get_box_size_ratios(box, frame_shape):
+    """박스가 전체 화면에서 차지하는 면적/높이 비율을 계산합니다."""
     frame_height, frame_width = frame_shape[:2]
     x1, y1, x2, y2 = box[:4]
     box_width = max(0.0, float(x2 - x1))
@@ -131,6 +151,7 @@ def is_valid_box(box):
 
 
 def is_close_wall_candidate(class_name, confidence, box, frame_shape):
+    """큰 벽 박스는 낮은 confidence라도 시뮬레이터 회피에 중요하므로 따로 판정합니다."""
     if class_name != "wall" or confidence < CLOSE_WALL_CONFIDENCE_THRESHOLD:
         return False
     area_ratio, height_ratio = get_box_size_ratios(box, frame_shape)
@@ -138,6 +159,7 @@ def is_close_wall_candidate(class_name, confidence, box, frame_shape):
 
 
 def evaluate_detection_for_return(class_name, confidence, box, frame_shape, bypass_return_filter):
+    """모델 후보 하나를 실제 JSON 응답에 포함할지 결정하고, 거절 이유를 함께 반환합니다."""
     if class_name is None:
         return False, "class_name_none", None
     if not is_valid_box(box):
@@ -155,6 +177,7 @@ def evaluate_detection_for_return(class_name, confidence, box, frame_shape, bypa
 
 
 def decode_uploaded_image(image):
+    """Flask 업로드 파일을 OpenCV BGR 이미지 배열로 변환합니다."""
     image_bytes = image.read()
     if not image_bytes:
         return None
@@ -163,11 +186,13 @@ def decode_uploaded_image(image):
 
 
 def make_warmup_image():
+    """CUDA warm-up에 사용할 더미 이미지를 만듭니다."""
     size = max(32, YOLO_IMGSZ)
     return np.zeros((size, size, 3), dtype=np.uint8)
 
 
 def resolve_model_path():
+    """환경변수, 파인튜닝 후보, 기본 모델 순서로 사용할 weight 파일을 선택합니다."""
     if YOLO_MODEL_PATH_ENV:
         path = Path(YOLO_MODEL_PATH_ENV)
         return path if path.is_absolute() else PROJECT_ROOT / path
@@ -178,6 +203,7 @@ def resolve_model_path():
 
 
 def get_model_path_candidates():
+    """디버그 화면에서 어떤 모델 후보가 존재하는지 확인할 수 있도록 목록을 만듭니다."""
     candidates = [*FINETUNED_MODEL_PATHS, BASE_MODEL_PATH]
     return [
         {
@@ -197,7 +223,9 @@ model = YOLO(str(MODEL_PATH))
 model_names = normalize_model_names(model.names)
 public_names = get_public_model_names()
 detect_state_lock = Lock()
+# Ultralytics 추론은 무거운 작업이라 요청이 겹칠 때 동시에 여러 번 돌리지 않도록 별도 lock을 둡니다.
 yolo_predict_lock = Lock()
+# `/detect`가 마지막으로 처리한 결과와 성능 정보를 모아 `/debug_state`와 캐시 응답에서 공유합니다.
 detect_state = {
     "latest_detections": [],
     "latest_detection_timestamp": 0.0,
@@ -260,6 +288,7 @@ print("YOLO server ready")
 
 # 캐시, 로그, 디버그 상태는 `/detect` 요청을 빠르게 처리하고 문제를 추적하기 위한 보조 흐름입니다.
 def get_cuda_device_name():
+    """디버그 응답에 표시할 CUDA 장치 이름을 안전하게 조회합니다."""
     if not torch.cuda.is_available():
         return None
     try:
@@ -270,6 +299,7 @@ def get_cuda_device_name():
 
 
 def get_cached_detections(now_seconds):
+    """최근 탐지 결과가 아직 신선하면 YOLO를 다시 돌리지 않고 재사용합니다."""
     if not ENABLE_DETECT_CACHE:
         return None
     with detect_state_lock:
@@ -282,6 +312,7 @@ def get_cached_detections(now_seconds):
 
 
 def get_latest_detections():
+    """추론이 이미 진행 중일 때 즉시 반환할 마지막 결과를 읽습니다."""
     with detect_state_lock:
         latest_timestamp = detect_state["latest_detection_timestamp"]
         if latest_timestamp <= 0.0:
@@ -308,6 +339,7 @@ def update_detect_state(
     model_conf_used=None,
     fallback_used=False,
 ):
+    """최신 탐지 결과와 디버그 지표를 한 번에 갱신합니다."""
     with detect_state_lock:
         detect_state["latest_detections"] = list(detections)
         detect_state["latest_detection_timestamp"] = detection_timestamp
@@ -341,6 +373,7 @@ def log_detect_perf(
     returned_detection_count,
     cached,
 ):
+    """성능 로그 옵션이 켜져 있을 때 `/detect` 단계별 시간을 출력합니다."""
     if not YOLO_TIMING:
         return
     print(
@@ -357,6 +390,7 @@ def log_detect_perf(
 
 
 def return_cached_response(started_at, detections, detection_timestamp, reason):
+    """캐시로 응답할 때도 디버그 상태와 로그 형식을 일반 응답과 맞춥니다."""
     elapsed_ms = (time.perf_counter() - started_at) * 1000
     update_detect_state(
         detections,
@@ -378,6 +412,7 @@ def return_cached_response(started_at, detections, detection_timestamp, reason):
 
 
 def log_recognized_detections(detections, cached=False):
+    """인식된 객체를 콘솔에서 빠르게 확인하기 위한 선택 로그입니다."""
     if not YOLO_RECOGNITION_LOG:
         return
     if cached and not YOLO_RECOGNITION_LOG_CACHE:
@@ -399,6 +434,7 @@ def log_recognized_detections(detections, cached=False):
 
 
 def make_detection_response(class_name, box, confidence):
+    """시뮬레이터가 기대하는 detection JSON 필드만 남깁니다."""
     return {
         "className": class_name,
         "bbox": [float(coord) for coord in box[:4]],
@@ -418,6 +454,7 @@ def make_debug_detection(
     reject_reason,
     threshold,
 ):
+    """필터 통과/거절 이유까지 포함한 디버그용 detection 항목을 만듭니다."""
     item = {
         "modelClassName": model_class_name,
         "className": class_name,
@@ -431,6 +468,7 @@ def make_debug_detection(
 
 
 def result_box_count(results):
+    """fallback 추론 여부를 판단하기 위해 Ultralytics 결과의 박스 수를 셉니다."""
     if not results:
         return 0
     boxes = results[0].boxes
@@ -440,6 +478,7 @@ def result_box_count(results):
 
 
 def get_debug_state_payload():
+    """현재 서버 설정과 마지막 탐지 상태를 `/debug_state` 응답으로 묶습니다."""
     with detect_state_lock:
         state = dict(detect_state)
     return {
@@ -744,6 +783,7 @@ def debug_state():
 
 @app.route('/stereo_image', methods=['POST'])
 def stereo_image():
+    """스테레오 카메라 모드를 켰을 때 좌/우 이미지 수신 여부만 확인하는 자리입니다."""
     left_image = request.files.get('left_image')
     right_image = request.files.get('right_image')
 
@@ -754,6 +794,7 @@ def stereo_image():
     
 @app.route('/info', methods=['POST'])
 def info():
+    """시뮬레이터 상태 tick을 받는 엔드포인트입니다. 필요하면 여기서 pause/reset을 반환할 수 있습니다."""
     data = request.get_json(force=True)
     if not data:
         return jsonify({"error": "No JSON received"}), 400
@@ -770,8 +811,10 @@ def info():
 
 @app.route('/get_action', methods=['POST'])
 def get_action():
+    """현재는 AI 제어 로직 대신 준비된 명령 시퀀스를 하나씩 꺼내 보내는 테스트용 액션 API입니다."""
     data = request.get_json(force=True)
 
+    # 위치/포탑 값은 현재 로깅만 하지만, 이후 제어 정책을 붙일 때 입력 특징으로 사용할 수 있습니다.
     position = data.get("position", {})
     turret = data.get("turret", {})
 
@@ -785,6 +828,7 @@ def get_action():
     print(f"📨 Position received: x={pos_x}, y={pos_y}, z={pos_z}")
     print(f"🎯 Turret received: x={turret_x}, y={turret_y}")
 
+    # combined_commands는 pop으로 소비되므로 서버를 재시작하면 처음부터 반복됩니다.
     if combined_commands:
         command = combined_commands.pop(0)
     else:
@@ -801,6 +845,7 @@ def get_action():
 
 @app.route('/update_bullet', methods=['POST'])
 def update_bullet():
+    """탄착/피격 정보를 받아 로그로 남깁니다. 명중 기반 보상이나 분석을 붙일 때 쓰는 자리입니다."""
     data = request.get_json()
     if not data:
         return jsonify({"status": "ERROR", "message": "Invalid request data"}), 400
@@ -810,6 +855,7 @@ def update_bullet():
 
 @app.route('/set_destination', methods=['POST'])
 def set_destination():
+    """외부에서 목적지를 문자열 좌표로 지정할 때 형식을 검증해 시뮬레이터에 돌려줍니다."""
     data = request.get_json()
     if not data or "destination" not in data:
         return jsonify({"status": "ERROR", "message": "Missing destination data"}), 400
@@ -823,6 +869,7 @@ def set_destination():
 
 @app.route('/update_obstacle', methods=['POST'])
 def update_obstacle():
+    """장애물 상태 업데이트를 받아 추후 경로 계획/회피 로직에서 사용할 수 있게 만든 엔드포인트입니다."""
     data = request.get_json()
     if not data:
         return jsonify({'status': 'error', 'message': 'No data received'}), 400
@@ -832,6 +879,7 @@ def update_obstacle():
 
 @app.route('/collision', methods=['POST']) 
 def collision():
+    """충돌 이벤트를 받아 어떤 객체와 어느 위치에서 부딪혔는지 기록합니다."""
     data = request.get_json()
     if not data:
         return jsonify({'status': 'error', 'message': 'No collision data received'}), 400
@@ -850,6 +898,7 @@ def collision():
 # 에피소드가 시작될 때 시뮬레이터가 읽는 초기 설정입니다.
 @app.route('/init', methods=['GET'])
 def init():
+    """시뮬레이터 에피소드 시작 시 월드/카메라/로그 옵션을 전달합니다."""
     config = {
         "startMode": "start",  # Options: "start" or "pause"
         "blStartX": 60,  #Blue Start Position
@@ -874,10 +923,12 @@ def init():
 
 @app.route('/start', methods=['GET'])
 def start():
+    """시뮬레이터가 시작 신호를 확인하는 간단한 헬스체크성 엔드포인트입니다."""
     print("🚀 /start command received")
     return jsonify({"control": ""})
 
 if __name__ == '__main__':
+    # Flask 바인딩 주소는 YAML 설정을 따르고, YOLO 관련 옵션은 위의 환경변수를 따릅니다.
     config = load_config()
 
     host = config["simulator"]["host"]
