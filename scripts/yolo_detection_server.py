@@ -33,6 +33,13 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 CONFIG_PATH = PROJECT_ROOT / "configs" / "simulator.yaml"
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "tank_detector" / "best_final.engine"
 DEFAULT_FALLBACK_MODEL_PATH = PROJECT_ROOT / "models" / "tank_detector" / "best.pt"
+
+# 큰 흐름:
+# 1. 서버 시작 시 설정값과 YOLO 모델을 로드합니다. TensorRT engine이 실패하면 best.pt로 fallback할 수 있습니다.
+# 2. simulator가 /detect로 이미지를 보내면 서버가 이미지를 디코딩하고 YOLO 추론을 실행합니다.
+# 3. 모델 class id를 simulator가 쓰는 공개 className으로 변환한 뒤 confidence, 무시 클래스, 반환 개수 기준으로 필터링합니다.
+# 4. 마지막 탐지 결과와 성능 지표는 detect_state에 저장되어 /debug_state에서 확인할 수 있습니다.
+# 5. /init, /info, /get_action 등은 simulator 실행에 필요한 제어/상태 API를 같은 Flask 서버에서 제공합니다.
 # `YOLO_MODEL_PATH` 환경변수를 주면 기본 모델 대신 해당 weight를 사용합니다.
 CLASS_ALIASES = {
     "blue": "person",
@@ -403,6 +410,8 @@ MODEL_PATH_FROM_ENV = bool(YOLO_MODEL_PATH_ENV)
 MODEL_PATH = resolve_model_path()
 REQUESTED_MODEL_PATH = MODEL_PATH
 MODEL_FALLBACK_PATH = resolve_fallback_model_path()
+
+# 모델은 서버 시작 시 한 번만 올립니다. 이후 /detect 요청은 이 전역 model 객체를 재사용합니다.
 print(f"Loading YOLO model: {MODEL_PATH}")
 MODEL_PATH, model, model_names, MODEL_LOAD_FALLBACK_USED, MODEL_LOAD_ERROR = (
     load_yolo_model_with_fallback(MODEL_PATH, MODEL_FALLBACK_PATH)
@@ -837,6 +846,8 @@ combined_commands = [
 # 메인 탐지 엔드포인트: 이미지 수신 -> YOLO 추론 -> 필터링 -> JSON 응답.
 @app.route('/detect', methods=['POST'])
 def detect():
+    # /detect 처리 순서:
+    # 이미지 수신 -> 캐시/동시 실행 여부 확인 -> YOLO 추론 -> 반환용 detection 필터링 -> debug 상태 저장.
     started_at = time.perf_counter()
     image = request.files.get('image')
     if not image:

@@ -59,6 +59,15 @@ YOLO_ALLOW_MODEL_FALLBACK = os.getenv("YOLO_ALLOW_MODEL_FALLBACK", "true").lower
 MODEL_LOAD_FALLBACK_USED = False
 MODEL_LOAD_ERROR: Optional[str] = None
 
+
+# 큰 흐름:
+# 1. 서버 시작 시 YOLO 모델을 한 번 로드합니다. TensorRT engine이 실패하면 best.pt로 fallback할 수 있습니다.
+# 2. /detect는 simulator가 보낸 최신 이미지를 저장하고 worker를 깨운 뒤, 직전 YOLO 결과를 즉시 반환합니다.
+# 3. yolo_worker_loop는 항상 가장 최신 프레임 하나만 골라 YOLO 추론을 수행하고 latest_detections를 갱신합니다.
+# 4. /view와 /video_feed는 최신 원본 프레임 위에 latest_detections를 그려서 브라우저에서 확인하게 해줍니다.
+# 5. /debug_state는 현재 모델, 프레임 번호, 추론 시간, 최근 에러를 한 번에 확인하는 진단용 API입니다.
+
+
 def parse_ignored_classes(default_value: str) -> set[str]:
     value = os.getenv("YOLO_IGNORED_CLASSES", default_value)
     return {item.strip().lower() for item in value.split(",") if item.strip()}
@@ -207,6 +216,7 @@ def load_yolo_model_with_fallback(model_path: Path):
         return fallback_path, loaded_model, loaded_names, True, str(exc)
 
 
+# 시작 시 모델 로드는 한 번만 수행합니다. 이후 /detect 요청마다 모델을 다시 만들지 않습니다.
 print(f"Loading YOLO model: {YOLO_MODEL_PATH}")
 YOLO_MODEL_PATH, model, model_names, MODEL_LOAD_FALLBACK_USED, MODEL_LOAD_ERROR = (
     load_yolo_model_with_fallback(YOLO_MODEL_PATH)
@@ -368,6 +378,8 @@ def run_yolo_only(frame: np.ndarray) -> Tuple[List[Dict[str, Any]], float, float
     화면에 그릴 이미지는 여기서 만들지 않습니다. worker는 숫자 결과만 저장하고,
     스트리밍 루프가 최신 원본 프레임에 bbox를 덧그려 웹 응답을 만듭니다.
     """
+    # worker에서만 호출되는 핵심 추론 함수입니다.
+    # 모델 결과를 simulator/view가 공통으로 쓰는 detection dict 목록으로 변환합니다.
     yolo_started = time.perf_counter()
     with torch.inference_mode():
         results = model.predict(
@@ -546,6 +558,8 @@ def detect():
     global latest_frame, latest_frame_seq, latest_frame_timestamp, latest_frame_shape
     global latest_detect_response_ms, latest_decode_ms, latest_error, request_count
 
+    # /detect는 실시간성을 위해 YOLO 완료를 기다리지 않습니다.
+    # 새 프레임은 worker에게 넘기고, 응답은 직전에 완성된 detection을 즉시 돌려줍니다.
     request_started = time.perf_counter()
     image = request.files.get("image")
     if image is None:
@@ -670,6 +684,8 @@ def view():
 
 def generate_video_stream():
     """MJPEG 스트림을 생성합니다. 브라우저는 각 JPEG 조각을 이어서 영상처럼 표시합니다."""
+    # /view의 <img> 태그가 이 generator를 계속 읽습니다.
+    # latest_frame과 latest_detections는 worker가 갱신한 최신 상태를 사용합니다.
     interval = 1.0 / max(1.0, WEB_FPS)
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
 

@@ -52,6 +52,13 @@ CLASS_ALIASES = {
 IGNORED_SOURCE_CLASSES = {"car"}
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".webp"}
 
+# 큰 흐름:
+# 1. CLI 인자와 환경변수로 workspace, base dataset, Roboflow 다운로드 여부, 학습 옵션을 정합니다.
+# 2. base dataset과 Roboflow dataset의 class id를 FINAL_CLASSES 기준으로 다시 매핑해 combined dataset을 만듭니다.
+# 3. valid split에 class별 샘플이 부족하면 train 샘플 일부를 valid로 옮기고, focus class는 train에서 복제해 보강합니다.
+# 4. combined/data.yaml을 만든 뒤 build-only가 아니면 기존 best.pt에서 이어서 Ultralytics YOLO를 fine-tune합니다.
+# 5. 학습이 끝나면 runs/detect/<name>/weights/best.pt 경로를 출력하고, 옵션에 따라 검증까지 수행합니다.
+
 
 @dataclass
 class CopyStats:
@@ -650,6 +657,8 @@ def find_dataset_root(path: Path) -> Path:
 
 def build_combined_dataset(args: argparse.Namespace) -> tuple[Path, list[str]]:
     """base 데이터셋과 Roboflow 데이터셋을 병합하고 학습 가능한 data.yaml을 만듭니다."""
+    # 데이터 준비 단계의 중심 함수입니다.
+    # 입력 dataset들을 같은 class 체계로 복사하고, split 보정/oversampling까지 끝낸 뒤 data.yaml을 반환합니다.
     workspace = args.workspace.resolve()
     download_dir = workspace / "roboflow_download"
     combined_dir = workspace / "combined"
@@ -720,6 +729,7 @@ def resolve_best_pt(path: Path) -> Path:
 
 def fine_tune(args: argparse.Namespace, data_yaml: Path) -> Path:
     """준비된 data.yaml과 기존 best.pt를 사용해 Ultralytics YOLO 학습을 실행합니다."""
+    # 학습 단계는 여기서만 수행합니다. build-only 실행은 이 함수를 호출하지 않고 dataset 생성까지만 합니다.
     from ultralytics import YOLO
 
     best_pt = resolve_best_pt(args.best_pt)
@@ -761,6 +771,7 @@ def fine_tune(args: argparse.Namespace, data_yaml: Path) -> Path:
 
 def main() -> None:
     """데이터셋을 만든 뒤, build-only가 아니면 바로 파인튜닝까지 실행합니다."""
+    # 실행 순서: 인자 파싱 -> combined dataset 생성 -> 필요하면 YOLO fine-tuning.
     args = parse_args()
     # Windows/OpenMP 조합에서 중복 런타임 경고로 종료되는 문제를 피하기 위한 기본값입니다.
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
