@@ -32,6 +32,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 CONFIG_PATH = PROJECT_ROOT / "configs" / "simulator.yaml"
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "tank_detector" / "best_final.engine"
+DEFAULT_FALLBACK_MODEL_PATH = PROJECT_ROOT / "models" / "tank_detector" / "best.pt"
 # `YOLO_MODEL_PATH` 환경변수를 주면 기본 모델 대신 해당 weight를 사용합니다.
 CLASS_ALIASES = {
     "blue": "person",
@@ -39,7 +40,12 @@ CLASS_ALIASES = {
     "tank": "tank",
 }
 # 학습 데이터에는 남아 있어도 시뮬레이터 제어에는 쓰지 않는 클래스입니다.
-IGNORED_CLASSES = {"car"}
+def parse_ignored_classes(default_value):
+    value = os.getenv("YOLO_IGNORED_CLASSES", default_value)
+    return {item.strip().lower() for item in value.split(",") if item.strip()}
+
+
+IGNORED_CLASSES = parse_ignored_classes("car,wall")
 CLASS_COLORS_BGR = {
     "tank": (0, 0, 255),
     "wall": (255, 0, 0),
@@ -147,6 +153,7 @@ YOLO_WARMUP_RUNS = int(os.getenv("YOLO_WARMUP_RUNS", "2"))
 ENABLE_DETECT_CACHE = env_flag("YOLO_DETECT_CACHE", True)
 YOLO_MIN_INTERVAL = float(os.getenv("YOLO_MIN_INTERVAL", "0.12"))
 YOLO_BYPASS_RETURN_FILTER = env_flag("YOLO_BYPASS_RETURN_FILTER", False)
+YOLO_ALLOW_MODEL_FALLBACK = env_flag("YOLO_ALLOW_MODEL_FALLBACK", True)
 # 아무 후보도 없을 때만 낮은 confidence로 한 번 더 추론하는 디버그/실험용 옵션입니다.
 YOLO_LOW_CONF_FALLBACK = env_flag("YOLO_LOW_CONF_FALLBACK", False)
 YOLO_RETURN_FALLBACK_DETECTIONS = env_flag("YOLO_RETURN_FALLBACK_DETECTIONS", True)
@@ -260,6 +267,13 @@ def resolve_model_path():
     return DEFAULT_MODEL_PATH
 
 
+def resolve_fallback_model_path():
+    if YOLO_FALLBACK_MODEL_PATH_ENV:
+        path = Path(YOLO_FALLBACK_MODEL_PATH_ENV)
+        return path if path.is_absolute() else PROJECT_ROOT / path
+    return DEFAULT_FALLBACK_MODEL_PATH
+
+
 def get_model_path_candidates():
     """디버그 화면에서 현재 사용할 모델 경로가 존재하는지 확인할 수 있도록 목록을 만듭니다."""
     candidates = []
@@ -267,6 +281,9 @@ def get_model_path_candidates():
         env_path = Path(YOLO_MODEL_PATH_ENV)
         candidates.append(env_path if env_path.is_absolute() else PROJECT_ROOT / env_path)
     candidates.append(DEFAULT_MODEL_PATH)
+    fallback_path = resolve_fallback_model_path()
+    if fallback_path not in candidates:
+        candidates.append(fallback_path)
     return [
         {
             "path": str(path),
@@ -357,11 +374,39 @@ def load_yolo_model(model_path):
     return loaded_model, loaded_names
 
 
+def load_yolo_model_with_fallback(model_path, fallback_path):
+    try:
+        ensure_model_runtime(model_path)
+        loaded_model, loaded_names = load_yolo_model(model_path)
+        return model_path, loaded_model, loaded_names, False, None
+    except (AttributeError, RuntimeError, ValueError, OSError, ModuleNotFoundError) as exc:
+        can_fallback = (
+            model_path.suffix.lower() == ".engine"
+            and YOLO_ALLOW_MODEL_FALLBACK
+            and fallback_path.exists()
+            and fallback_path.resolve() != model_path.resolve()
+        )
+        if not can_fallback:
+            raise
+        print(f"[WARNING] Could not load requested TensorRT engine: {model_path}")
+        print(f"[WARNING] {exc}")
+        print(f"[WARNING] Falling back to YOLO model: {fallback_path}")
+        ensure_model_runtime(fallback_path)
+        loaded_model, loaded_names = load_yolo_model(fallback_path)
+        return fallback_path, loaded_model, loaded_names, True, str(exc)
+
+
 app = Flask(__name__)
 YOLO_MODEL_PATH_ENV = os.getenv("YOLO_MODEL_PATH")
+YOLO_FALLBACK_MODEL_PATH_ENV = os.getenv("YOLO_FALLBACK_MODEL_PATH")
 MODEL_PATH_FROM_ENV = bool(YOLO_MODEL_PATH_ENV)
 MODEL_PATH = resolve_model_path()
-ensure_model_runtime(MODEL_PATH)
+REQUESTED_MODEL_PATH = MODEL_PATH
+MODEL_FALLBACK_PATH = resolve_fallback_model_path()
+print(f"Loading YOLO model: {MODEL_PATH}")
+MODEL_PATH, model, model_names, MODEL_LOAD_FALLBACK_USED, MODEL_LOAD_ERROR = (
+    load_yolo_model_with_fallback(MODEL_PATH, MODEL_FALLBACK_PATH)
+)
 engine_imgsz = get_tensorrt_engine_imgsz(MODEL_PATH)
 if engine_imgsz is not None and YOLO_IMGSZ != engine_imgsz:
     print(
@@ -369,7 +414,6 @@ if engine_imgsz is not None and YOLO_IMGSZ != engine_imgsz:
         f"{engine_imgsz}."
     )
     YOLO_IMGSZ = engine_imgsz
-model, model_names = load_yolo_model(MODEL_PATH)
 public_names = get_public_model_names()
 detect_state_lock = Lock()
 # Ultralytics 추론은 무거운 작업이라 요청이 겹칠 때 동시에 여러 번 돌리지 않도록 별도 lock을 둡니다.
@@ -397,7 +441,9 @@ detect_state = {
     "latest_fallback_used": False,
 }
 print(f"YOLO_MODEL_PATH env set: {MODEL_PATH_FROM_ENV}")
+print(f"Requested YOLO model: {REQUESTED_MODEL_PATH}")
 print(f"Loaded YOLO model: {MODEL_PATH}")
+print(f"Model load fallback used: {MODEL_LOAD_FALLBACK_USED}")
 print(f"Model labels: {model_names}")
 print(f"Public labels: {public_names}")
 print(
@@ -643,8 +689,14 @@ def get_debug_state_payload():
     return {
         "serverMode": SERVER_MODE,
         "modelPath": str(MODEL_PATH),
+        "requestedModelPath": str(REQUESTED_MODEL_PATH),
         "modelPathFromEnv": MODEL_PATH_FROM_ENV,
         "modelPathEnvValue": YOLO_MODEL_PATH_ENV,
+        "modelFallbackPath": str(MODEL_FALLBACK_PATH),
+        "modelFallbackPathEnvValue": YOLO_FALLBACK_MODEL_PATH_ENV,
+        "modelFallbackAllowed": YOLO_ALLOW_MODEL_FALLBACK,
+        "modelLoadFallbackUsed": MODEL_LOAD_FALLBACK_USED,
+        "modelLoadError": MODEL_LOAD_ERROR,
         "modelPathCandidates": get_model_path_candidates(),
         "modelNames": model_names,
         "publicNames": public_names,

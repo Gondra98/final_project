@@ -34,10 +34,35 @@ from ultralytics import YOLO
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "tank_detector" / "best_final.engine"
+DEFAULT_FALLBACK_MODEL_PATH = PROJECT_ROOT / "models" / "tank_detector" / "best.pt"
 # 웹 확인용 서버는 기본적으로 최종 best_final.engine를 사용하지만, YOLO_MODEL_PATH로 다른 weight를 지정할 수 있습니다.
-YOLO_MODEL_PATH = Path(os.getenv("YOLO_MODEL_PATH", str(DEFAULT_MODEL_PATH)))
-if not YOLO_MODEL_PATH.is_absolute():
-    YOLO_MODEL_PATH = (PROJECT_ROOT / YOLO_MODEL_PATH).resolve()
+YOLO_MODEL_PATH_ENV = os.getenv("YOLO_MODEL_PATH")
+YOLO_FALLBACK_MODEL_PATH_ENV = os.getenv("YOLO_FALLBACK_MODEL_PATH")
+
+
+def resolve_project_path(path_value) -> Path:
+    path = Path(path_value)
+    return path if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+
+
+YOLO_MODEL_PATH = resolve_project_path(YOLO_MODEL_PATH_ENV or DEFAULT_MODEL_PATH)
+REQUESTED_YOLO_MODEL_PATH = YOLO_MODEL_PATH
+YOLO_FALLBACK_MODEL_PATH = resolve_project_path(
+    YOLO_FALLBACK_MODEL_PATH_ENV or DEFAULT_FALLBACK_MODEL_PATH
+)
+YOLO_ALLOW_MODEL_FALLBACK = os.getenv("YOLO_ALLOW_MODEL_FALLBACK", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+MODEL_LOAD_FALLBACK_USED = False
+MODEL_LOAD_ERROR: Optional[str] = None
+
+def parse_ignored_classes(default_value: str) -> set[str]:
+    value = os.getenv("YOLO_IGNORED_CLASSES", default_value)
+    return {item.strip().lower() for item in value.split(",") if item.strip()}
+
 
 HOST = os.getenv("SERVER_HOST", "0.0.0.0")
 PORT = int(os.getenv("SERVER_PORT", "5000"))
@@ -53,6 +78,7 @@ YOLO_IOU = float(os.getenv("YOLO_IOU", "0.70"))
 YOLO_MAX_DET = int(os.getenv("YOLO_MAX_DET", "30"))
 YOLO_DISTANCE_FOV_DEG = float(os.getenv("YOLO_DISTANCE_FOV_DEG", "60"))
 YOLO_DISTANCE_MIN_BOX_HEIGHT = float(os.getenv("YOLO_DISTANCE_MIN_BOX_HEIGHT", "2"))
+IGNORED_CLASSES = parse_ignored_classes("wall")
 
 WEB_FPS = float(os.getenv("WEB_FPS", "20"))
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "80"))
@@ -158,7 +184,33 @@ def load_yolo_model(model_path: Path):
     return loaded_model, loaded_names
 
 
-ensure_model_runtime(YOLO_MODEL_PATH)
+def load_yolo_model_with_fallback(model_path: Path):
+    try:
+        ensure_model_runtime(model_path)
+        loaded_model, loaded_names = load_yolo_model(model_path)
+        return model_path, loaded_model, loaded_names, False, None
+    except (AttributeError, RuntimeError, ValueError, OSError, ModuleNotFoundError) as exc:
+        fallback_path = YOLO_FALLBACK_MODEL_PATH
+        can_fallback = (
+            model_path.suffix.lower() == ".engine"
+            and YOLO_ALLOW_MODEL_FALLBACK
+            and fallback_path.exists()
+            and fallback_path.resolve() != model_path.resolve()
+        )
+        if not can_fallback:
+            raise
+        print(f"[WARNING] Could not load requested TensorRT engine: {model_path}")
+        print(f"[WARNING] {exc}")
+        print(f"[WARNING] Falling back to YOLO model: {fallback_path}")
+        ensure_model_runtime(fallback_path)
+        loaded_model, loaded_names = load_yolo_model(fallback_path)
+        return fallback_path, loaded_model, loaded_names, True, str(exc)
+
+
+print(f"Loading YOLO model: {YOLO_MODEL_PATH}")
+YOLO_MODEL_PATH, model, model_names, MODEL_LOAD_FALLBACK_USED, MODEL_LOAD_ERROR = (
+    load_yolo_model_with_fallback(YOLO_MODEL_PATH)
+)
 engine_imgsz = get_tensorrt_engine_imgsz(YOLO_MODEL_PATH)
 if engine_imgsz is not None and YOLO_IMGSZ != engine_imgsz:
     print(
@@ -166,8 +218,8 @@ if engine_imgsz is not None and YOLO_IMGSZ != engine_imgsz:
         f"{engine_imgsz}."
     )
     YOLO_IMGSZ = engine_imgsz
-print(f"Loading YOLO model: {YOLO_MODEL_PATH}")
-model, model_names = load_yolo_model(YOLO_MODEL_PATH)
+if MODEL_LOAD_FALLBACK_USED:
+    print(f"Loaded fallback YOLO model: {YOLO_MODEL_PATH}")
 print(f"Model labels: {model_names}")
 print(
     "YOLO runtime: "
@@ -252,23 +304,51 @@ def estimate_distance_by_height(
     bbox: List[float],
     frame_shape: Tuple[int, ...],
 ) -> Optional[float]:
-    if len(bbox) < 4:
+    if len(bbox) < 4 or not frame_shape:
         return None
-    reference_height_m = get_class_height_m(class_name)
-    if reference_height_m is None or reference_height_m <= 0:
+    bbox_h_px = float(bbox[3]) - float(bbox[1])
+    img_h = float(frame_shape[0])
+    if bbox_h_px <= 0 or img_h <= 0:
         return None
+    height = bbox_h_px / img_h
+    class_name_lower = class_name.lower()
 
-    box_height_px = max(0.0, float(bbox[3]) - float(bbox[1]))
-    if box_height_px < YOLO_DISTANCE_MIN_BOX_HEIGHT:
-        return None
-
-    frame_height_px = max(1.0, float(frame_shape[0]))
-    if not 0 < YOLO_DISTANCE_FOV_DEG < 180:
-        return None
-    half_fov_rad = math.radians(YOLO_DISTANCE_FOV_DEG) / 2.0
-    focal_length_px = frame_height_px / (2.0 * math.tan(half_fov_rad))
-    distance_m = (reference_height_m * focal_length_px) / box_height_px
-    return round(float(distance_m), 2)
+    if class_name_lower == "tank":
+        calib = [
+            (30/450,122.44),(20/450,123.72),(26/450,106.7),(31/450,85.01),
+            (40/450,61.62),(61/450,40.7),(22/450,111.21),(26/450,89.65),
+            (27/450,85.97),(35/450,63.8),(26/450,89.56),(33/450,66.78),
+            (49/450,44.41),(28/450,82.46),(37/450,60.91),(59/450,37.52),
+            (27/450,82.85),(36/450,61.48),(56/450,40.03),(27/450,90.58),
+            (33/450,69.36),(103/450,26.14),(31/450,73.06),(51/450,49.6),
+            (18/450,133.93),(19/450,115.44),(25/450,92.33),(34/450,71.8),
+            (52/450,48.16),(102/450,27.09),(15/450,147.45),(16/450,134.81),
+            (17/450,118.48),(21/450,96.3),(30/450,72.45),(47/450,49.7),
+            (87/450,28.0),(23/450,95.54),(81/450,28.53),(25/450,92.56),
+            (33/450,69.64),(48/450,45.81),
+        ]
+    elif class_name_lower in ("person"):
+        calib = [
+            (48/450,44.68),(97/450,24.36),(31/450,84.13),(39/450,66.52),
+            (25/450,90.61),(34/450,68.59),(47/450,44.72),(94/450,22.34),
+            (60/450,32.74),(23/450,90.78),(53/450,47.52),(22/450,91.84),
+            (53/450,46.82),
+        ]
+    elif class_name_lower == "tent":
+        calib = [
+            (472/1057,30),(370/1057,40),(328/1057,50),
+            (269/1057,60),(226/1057,70),(196/1057,80),
+            (169/1057,90),(150/1057,100),(139/1057,110),
+            (116/1057,130),
+        ]
+    else:
+        return float(round(3.0 / height, 1)) if height > 0 else None
+    
+    heights = np.array([h for h, d in calib])
+    distances = np.array([d for h, d in calib])
+    coeffs = np.polyfit(1.0 / heights, distances, 1)
+    a, b = coeffs[0], coeffs[1]
+    return float(round(max(0.0, a / height + b), 1))
 
 # =========================
 # 유틸 함수
@@ -313,6 +393,8 @@ def run_yolo_only(frame: np.ndarray) -> Tuple[List[Dict[str, Any]], float, float
             x1, y1, x2, y2, conf, cls_id = box[:6]
             class_id = int(cls_id)
             class_name = str(model_names.get(class_id, class_id))
+            if class_name.strip().lower() in IGNORED_CLASSES:
+                continue
             color = get_class_hex_color(class_name, class_id)
             bbox = [float(x1), float(y1), float(x2), float(y2)]
             distance = estimate_distance_by_height(class_name, bbox, frame.shape)
@@ -625,7 +707,14 @@ def debug_state():
         frame_age = time.time() - latest_frame_timestamp if latest_frame_timestamp else None
         payload = {
             "modelPath": str(YOLO_MODEL_PATH),
+            "requestedModelPath": str(REQUESTED_YOLO_MODEL_PATH),
+            "modelPathEnvValue": YOLO_MODEL_PATH_ENV,
+            "modelFallbackPath": str(YOLO_FALLBACK_MODEL_PATH),
+            "modelFallbackAllowed": YOLO_ALLOW_MODEL_FALLBACK,
+            "modelFallbackUsed": MODEL_LOAD_FALLBACK_USED,
+            "modelLoadError": MODEL_LOAD_ERROR,
             "modelNames": model_names,
+            "ignoredClasses": sorted(IGNORED_CLASSES),
             "device": YOLO_DEVICE,
             "cudaAvailable": torch.cuda.is_available(),
             "half": YOLO_HALF,
