@@ -351,8 +351,15 @@ def estimate_distance_by_height(
             (169/1057,90),(150/1057,100),(139/1057,110),
             (116/1057,130),
         ]
+    elif class_name_lower == "rock":
+        calib = [
+            (407/1057, 20), (292/1057, 30), (213/1057, 40),
+            (160/1057, 50), (128/1057, 60), (110/1057, 70),
+            (94/1057, 80),  (88/1057, 90),  (78/1057, 100),
+            (68/1057, 120),
+        ]
     else:
-        return float(round(3.0 / height, 1)) if height > 0 else None
+        return float(round(1.0 / height, 1)) if height > 0 else None
     
     heights = np.array([h for h, d in calib])
     distances = np.array([d for h, d in calib])
