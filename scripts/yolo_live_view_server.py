@@ -33,7 +33,7 @@ from ultralytics import YOLO
 # =========================
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
-DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "tank_detector" / "best_final.engine"
+DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "tank_detector" / "best_final.pt"
 DEFAULT_FALLBACK_MODEL_PATH = PROJECT_ROOT / "models" / "tank_detector" / "best.pt"
 # 웹 확인용 서버는 기본적으로 최종 best_final.engine를 사용하지만, YOLO_MODEL_PATH로 다른 weight를 지정할 수 있습니다.
 YOLO_MODEL_PATH_ENV = os.getenv("YOLO_MODEL_PATH")
@@ -351,8 +351,15 @@ def estimate_distance_by_height(
             (169/1057,90),(150/1057,100),(139/1057,110),
             (116/1057,130),
         ]
+    elif class_name_lower == "rock":
+        calib = [
+            (407/1057, 20), (292/1057, 30), (213/1057, 40),
+            (160/1057, 50), (128/1057, 60), (110/1057, 70),
+            (94/1057, 80),  (88/1057, 90),  (78/1057, 100),
+            (68/1057, 120),
+        ]
     else:
-        return float(round(3.0 / height, 1)) if height > 0 else None
+        return float(round(1.0 / height, 1)) if height > 0 else None
     
     heights = np.array([h for h, d in calib])
     distances = np.array([d for h, d in calib])
