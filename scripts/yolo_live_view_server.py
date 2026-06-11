@@ -132,48 +132,6 @@ def ensure_model_runtime(model_path: Path) -> None:
         ) from exc
 
 
-def get_tensorrt_engine_imgsz(model_path: Path) -> Optional[int]:
-    if model_path.suffix.lower() != ".engine":
-        return None
-    try:
-        import json
-        import tensorrt as trt
-
-        logger = trt.Logger(trt.Logger.WARNING)
-        with model_path.open("rb") as f, trt.Runtime(logger) as runtime:
-            try:
-                meta_len = int.from_bytes(f.read(4), byteorder="little")
-                json.loads(f.read(meta_len).decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                f.seek(0)
-            engine = runtime.deserialize_cuda_engine(f.read())
-        if engine is None:
-            return None
-        is_trt10 = hasattr(engine, "num_io_tensors")
-        indices = range(engine.num_io_tensors) if is_trt10 else range(engine.num_bindings)
-        for index in indices:
-            if is_trt10:
-                tensor_name = engine.get_tensor_name(index)
-                if engine.get_tensor_mode(tensor_name) != trt.TensorIOMode.INPUT:
-                    continue
-                shape = tuple(int(dim) for dim in engine.get_tensor_shape(tensor_name))
-            else:
-                if not engine.binding_is_input(index):
-                    continue
-                shape = tuple(int(dim) for dim in engine.get_binding_shape(index))
-            if len(shape) >= 4 and shape[1] in {1, 3, 4}:
-                height, width = shape[2], shape[3]
-            elif len(shape) >= 3:
-                height, width = shape[1], shape[2]
-            else:
-                continue
-            if height > 0 and height == width:
-                return height
-    except Exception:
-        return None
-    return None
-
-
 def normalize_model_names(names):
     if isinstance(names, dict):
         return {int(class_id): str(name) for class_id, name in names.items()}
@@ -264,7 +222,6 @@ latest_frame_timestamp: float = 0.0
 
 processed_frame_seq: int = 0                      # YOLO가 마지막으로 처리한 프레임 번호
 latest_detections: List[Dict[str, Any]] = []
-latest_lidar_points: List[Dict] = []
 latest_yolo_ms: float = 0.0
 latest_post_ms: float = 0.0
 latest_worker_total_ms: float = 0.0
@@ -323,88 +280,72 @@ def get_class_height_m(class_name: str) -> Optional[float]:
     return CLASS_HEIGHTS_M.get(str(class_name).strip().lower())
 
 
-# def estimate_distance_by_height(
-#     class_name: str,
-#     bbox: List[float],
-#     frame_shape: Tuple[int, ...],
-# ) -> Optional[float]:
-#     if len(bbox) < 4 or not frame_shape:
-#         return None
-#     bbox_h_px = float(bbox[3]) - float(bbox[1])
-#     img_h = float(frame_shape[0])
-#     if bbox_h_px <= 0 or img_h <= 0:
-#         return None
-#     height = bbox_h_px / img_h
-#     class_name_lower = class_name.lower()
-
-#     if class_name_lower == "tank":
-#         calib = [
-#             (216/1057, 30), (147/1057, 40), (111/1057, 50),
-#             (94/1057,  60), (73/1057,  70), (63/1057,  80),
-#             (59/1057,  90), (52/1057, 100),
-#         ]
-#     elif class_name_lower in ("person"):
-#         calib = [
-#             (191/1057, 30), (139/1057, 40),
-#             (113/1057, 50), (88/1057,  60),
-#         ]
-#     elif class_name_lower == "tent":
-#         calib = [
-#             (472/1057,30),(370/1057,40),(328/1057,50),
-#             (269/1057,60),(226/1057,70),(196/1057,80),
-#             (169/1057,90),(150/1057,100),(139/1057,110),
-#             (116/1057,130),
-#         ]
-#     elif class_name_lower == "rock":
-#         calib = [
-#             (407/1057, 20), (292/1057, 30), (213/1057, 40),
-#             (160/1057, 50), (128/1057, 60), (110/1057, 70),
-#             (94/1057, 80),  (88/1057, 90),  (78/1057, 100),
-#             (68/1057, 120),
-#         ]
-#     else:
-#         return float(round(1.0 / height, 1)) if height > 0 else None
-    
-#     heights = np.array([h for h, d in calib])
-#     distances = np.array([d for h, d in calib])
-#     coeffs = np.polyfit(1.0 / heights, distances, 1)
-#     a, b = coeffs[0], coeffs[1]
-#     return float(round(max(0.0, a / height + b), 1))
-
-
-def estimate_distance_by_lidar(
+def estimate_distance_by_height(
+    class_name: str,
     bbox: List[float],
     frame_shape: Tuple[int, ...],
-    lidar_points: List[Dict],
-    fov_deg: float = 30.0,
 ) -> Optional[float]:
-    if not lidar_points or not frame_shape:
+    if len(bbox) < 4 or not frame_shape:
         return None
-    bbox_cx = (bbox[0] + bbox[2]) / 2.0
-    img_w = float(frame_shape[1])
-    angle = (bbox_cx / img_w - 0.5) * fov_deg
-    if angle < 0:
-        angle += 360
-    candidates = [
-        p["distance"] for p in lidar_points
-        if abs(p.get("verticalAngle", 90)) < 5.0
-        and min(abs(p.get("angle", 999) - angle), 360 - abs(p.get("angle", 999) - angle)) < 5.0
-    ]
-    all_same_angle = [
-        p["distance"] for p in lidar_points
-        if min(abs(p.get("angle", 999) - angle), 360 - abs(p.get("angle", 999) - angle)) < 5.0
-    ]
-    ground_dist = max(all_same_angle) if all_same_angle else 999
-    objects = [d for d in candidates if d < ground_dist - 1.5]
+    bbox_h_px = float(bbox[3]) - float(bbox[1])
+    img_h = float(frame_shape[0])
+    if bbox_h_px <= 0 or img_h <= 0:
+        return None
+    height = bbox_h_px / img_h
+    class_name_lower = class_name.lower()
 
-    print(f"[lidar] bbox_cx={bbox_cx:.0f} angle={angle:.1f}° candidates={candidates[:3]} ground={ground_dist:.1f} objects={objects[:3]}")
+    if class_name_lower == "tank":
+        calib = [
+            (246.4/1057, 22.1),
+            (172.1/1057, 32.6),
+            (135.0/1057, 38.3),
+            (108.3/1057, 47.1),
+            (88.7/1057,  59.7),
+            (78.6/1057,  66.7),
+            (70.5/1057,  75.6),
+            (62.2/1057,  88.7),
+            (51.4/1057,  101.9),
+        ]
+    elif class_name_lower == "person":
+        calib = [
+            (319.3/1057, 17.5),
+            (290.1/1057, 19.7),
+            (196.6/1057, 29.5),
+            (147.3/1057, 38.2),
+            (119.1/1057, 50.9),
+            (101.6/1057, 60.7),
+        ]
+    elif class_name_lower == "rock":
+        calib = [
+            (530.7/1057, 18.10),
+            (344.7/1057, 22.88),
+            (286.0/1057, 27.55),
+            (244.0/1057, 32.53),
+            (207.0/1057, 37.53),
+            (173.2/1057, 46.0),
+            (154.4/1057, 49.6),
+            (141.2/1057, 54.86),
+            (126.4/1057, 61.31),
+            (110.1/1057, 72.04),
+            (96.9/1057,  81.40),
+            (87.6/1057,  92.07),
+            (77.9/1057,  102.37),
+        ]
+    elif class_name_lower == "tent":
+        calib = [
+            (525.4/1057, 33.59), (454.4/1057, 37.92), (366.3/1057, 46.53),
+            (299.8/1057, 56.08), (257.4/1057, 62.90), (226.3/1057, 72.54),
+            (216.6/1057, 77.10), (189.5/1057, 85.86), (168.1/1057, 94.36),
+            (149.9/1057, 109.88),
+        ]
+    else:
+        return None
 
-    if objects:
-        return float(round(min(objects), 1))
-    elif candidates:
-        return float(round(min(candidates), 1))
-    return None
-
+    heights = np.array([h for h, d in calib])
+    distances = np.array([d for h, d in calib])
+    coeffs = np.polyfit(1.0 / heights, distances, 1)
+    a, b = coeffs[0], coeffs[1]
+    return float(round(max(0.0, a / height + b), 1))
 
 # =========================
 # 유틸 함수
@@ -486,7 +427,7 @@ def run_yolo_only(frame: np.ndarray) -> Tuple[List[Dict[str, Any]], float, float
             bbox = [float(x1), float(y1), float(x2), float(y2)]
             center_x = (float(x1) + float(x2)) / 2.0
             center_y = (float(y1) + float(y2)) / 2.0
-            distance = estimate_distance_by_lidar(bbox, frame.shape, lidar_pts)
+            distance = estimate_distance_by_height(class_name, bbox, frame.shape)
             detections.append(
                 {
                     "id": fixed_id,
@@ -725,6 +666,8 @@ def info():
     data = request.get_json(silent=True) or {}
     lidar_points = data.get("lidarPoints", [])
     if lidar_points:
+        angles = [p.get("angle") for p in lidar_points[:10]]
+        print(f"[info] count={len(lidar_points)} angles={angles}")  # 첫 번째 포인트 키 확인
         with state_lock:
             latest_lidar_points = lidar_points
     return jsonify({"status": "success", "control": ""})
