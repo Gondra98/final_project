@@ -33,7 +33,7 @@ from ultralytics import YOLO
 # =========================
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
-DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "tank_detector" / "best_final.pt"
+DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "tank_detector" / "best_final.engine"
 DEFAULT_FALLBACK_MODEL_PATH = PROJECT_ROOT / "models" / "tank_detector" / "best.pt"
 # 웹 확인용 서버는 기본적으로 최종 best_final.engine를 사용하지만, YOLO_MODEL_PATH로 다른 weight를 지정할 수 있습니다.
 YOLO_MODEL_PATH_ENV = os.getenv("YOLO_MODEL_PATH")
@@ -80,25 +80,27 @@ YOLO_DEVICE = os.getenv("YOLO_DEVICE", "0" if torch.cuda.is_available() else "cp
 USE_CUDA = torch.cuda.is_available() and YOLO_DEVICE.lower() != "cpu"
 # half precision은 CUDA에서만 의미가 있으므로 CPU 실행일 때는 자동으로 꺼집니다.
 YOLO_HALF = os.getenv("YOLO_HALF", "true").lower() in {"1", "true", "yes", "on"} and USE_CUDA
-REQUESTED_YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "416"))
+REQUESTED_YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "640"))
 YOLO_IMGSZ = REQUESTED_YOLO_IMGSZ
-YOLO_CONF = float(os.getenv("YOLO_CONF", "0.20"))
+YOLO_CONF = float(os.getenv("YOLO_CONF", "0.35"))
 YOLO_IOU = float(os.getenv("YOLO_IOU", "0.70"))
 YOLO_MAX_DET = int(os.getenv("YOLO_MAX_DET", "30"))
+YOLO_AGNOSTIC_NMS = os.getenv("YOLO_AGNOSTIC_NMS", "true").lower() in {"1", "true", "yes", "on"}
 # YOLO Tracking 설정. 추적이 필요 없으면 YOLO_TRACKING=false로 기존 predict 경로를 사용할 수 있습니다.
 YOLO_TRACKING = os.getenv("YOLO_TRACKING", "true").lower() in {"1", "true", "yes", "on"}
 YOLO_TRACKER = os.getenv("YOLO_TRACKER", "bytetrack.yaml")
 YOLO_TRACK_PERSIST = os.getenv("YOLO_TRACK_PERSIST", "true").lower() in {"1", "true", "yes", "on"}
 YOLO_DISTANCE_FOV_DEG = float(os.getenv("YOLO_DISTANCE_FOV_DEG", "60"))
 YOLO_DISTANCE_MIN_BOX_HEIGHT = float(os.getenv("YOLO_DISTANCE_MIN_BOX_HEIGHT", "2"))
-IGNORED_CLASSES = parse_ignored_classes("wall")
+IGNORED_CLASSES = parse_ignored_classes("")
 
 # 클래스별 고정 ID입니다. 같은 클래스가 여러 개 잡히면 classFixedId는 같고, trackId로 객체를 구분합니다.
 CLASS_FIXED_IDS = {
-    "tank": 1,
-    "rock": 2,
-    "person": 3,
-    "tent": 4,
+    "car": 1,
+    "person": 2,
+    "tank": 3,
+    "rock": 4,
+    "house": 5,
 }
 
 WEB_FPS = float(os.getenv("WEB_FPS", "20"))
@@ -130,6 +132,48 @@ def ensure_model_runtime(model_path: Path) -> None:
             "Install it in the active environment with: "
             "python -m pip install --upgrade tensorrt-cu12"
         ) from exc
+
+
+def get_tensorrt_engine_imgsz(model_path: Path) -> Optional[int]:
+    if model_path.suffix.lower() != ".engine":
+        return None
+    try:
+        import json
+        import tensorrt as trt
+
+        logger = trt.Logger(trt.Logger.WARNING)
+        with model_path.open("rb") as f, trt.Runtime(logger) as runtime:
+            try:
+                meta_len = int.from_bytes(f.read(4), byteorder="little")
+                json.loads(f.read(meta_len).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                f.seek(0)
+            engine = runtime.deserialize_cuda_engine(f.read())
+        if engine is None:
+            return None
+        is_trt10 = hasattr(engine, "num_io_tensors")
+        indices = range(engine.num_io_tensors) if is_trt10 else range(engine.num_bindings)
+        for index in indices:
+            if is_trt10:
+                tensor_name = engine.get_tensor_name(index)
+                if engine.get_tensor_mode(tensor_name) != trt.TensorIOMode.INPUT:
+                    continue
+                shape = tuple(int(dim) for dim in engine.get_tensor_shape(tensor_name))
+            else:
+                if not engine.binding_is_input(index):
+                    continue
+                shape = tuple(int(dim) for dim in engine.get_binding_shape(index))
+            if len(shape) >= 4 and shape[1] in {1, 3, 4}:
+                height, width = shape[2], shape[3]
+            elif len(shape) >= 3:
+                height, width = shape[1], shape[2]
+            else:
+                continue
+            if height > 0 and height == width:
+                return height
+    except Exception:
+        return None
+    return None
 
 
 def normalize_model_names(names):
@@ -205,6 +249,7 @@ print(
     "YOLO runtime: "
     f"device={YOLO_DEVICE}, half={YOLO_HALF}, imgsz={YOLO_IMGSZ}, "
     f"conf={YOLO_CONF}, iou={YOLO_IOU}, max_det={YOLO_MAX_DET}, "
+    f"agnostic_nms={YOLO_AGNOSTIC_NMS}, "
     f"tracking={YOLO_TRACKING}, tracker={YOLO_TRACKER}, persist={YOLO_TRACK_PERSIST}, "
     f"web_fps={WEB_FPS}, jpeg_quality={JPEG_QUALITY}"
 )
@@ -234,12 +279,11 @@ request_count: int = 0
 worker_count: int = 0
 
 CLASS_COLORS_BGR = {
-    "tank": (0, 0, 255),
-    "wall": (255, 0, 0),
-    "rock": (0, 255, 255),
-    "person": (0, 255, 0),
-    "tent": (255, 255, 0),
     "car": (255, 0, 255),
+    "person": (0, 255, 0),
+    "tank": (0, 0, 255),
+    "rock": (0, 255, 255),
+    "house": (255, 0, 0),
 }
 CLASS_COLOR_PALETTE_BGR = [
     (0, 255, 0),
@@ -251,12 +295,11 @@ CLASS_COLOR_PALETTE_BGR = [
     (255, 255, 255),
 ]
 CLASS_HEIGHTS_M = {
-    "tank": float(os.getenv("YOLO_DISTANCE_TANK_HEIGHT_M", "2.4")),
-    "wall": float(os.getenv("YOLO_DISTANCE_WALL_HEIGHT_M", "2.0")),
-    "rock": float(os.getenv("YOLO_DISTANCE_ROCK_HEIGHT_M", "0.8")),
-    "person": float(os.getenv("YOLO_DISTANCE_PERSON_HEIGHT_M", "1.7")),
-    "tent": float(os.getenv("YOLO_DISTANCE_TENT_HEIGHT_M", "1.6")),
     "car": float(os.getenv("YOLO_DISTANCE_CAR_HEIGHT_M", "1.5")),
+    "person": float(os.getenv("YOLO_DISTANCE_PERSON_HEIGHT_M", "1.7")),
+    "tank": float(os.getenv("YOLO_DISTANCE_TANK_HEIGHT_M", "2.4")),
+    "rock": float(os.getenv("YOLO_DISTANCE_ROCK_HEIGHT_M", "0.8")),
+    "house": float(os.getenv("YOLO_DISTANCE_HOUSE_HEIGHT_M", "2.5")),
 }
 
 
@@ -338,9 +381,30 @@ def estimate_distance_by_height(
             (216.6/1057, 77.10), (189.5/1057, 85.86), (168.1/1057, 94.36),
             (149.9/1057, 109.88),
         ]
+    elif class_name_lower == "house":
+        calib = [
+            (632.3/1057, 35.4),
+            (500.4/1057, 43.7),
+            (409.5/1057, 53.2),
+            (375.2/1057, 58.3),
+            (317.3/1057, 69.0),
+            (275.5/1057, 79.5),
+            (242.2/1057, 90.1),
+        ]
+    elif class_name_lower == "car":
+        calib = [
+            (334.2/1057, 19.8),
+            (223.7/1057, 28.4),
+            (161.0/1057, 38.6),
+            (131.9/1057, 46.8),
+            (104.8/1057, 58.6),
+            (82.6/1057,  72.9),
+            (70.4/1057,  82.4),
+            (64.5/1057,  91.1),
+        ]
     else:
-        return None
-
+        return float(round(1.0 / height, 1)) if height > 0 else None
+    
     heights = np.array([h for h, d in calib])
     distances = np.array([d for h, d in calib])
     coeffs = np.polyfit(1.0 / heights, distances, 1)
@@ -380,6 +444,7 @@ def run_yolo_only(frame: np.ndarray) -> Tuple[List[Dict[str, Any]], float, float
                 half=YOLO_HALF,
                 iou=YOLO_IOU,
                 max_det=YOLO_MAX_DET,
+                agnostic_nms=YOLO_AGNOSTIC_NMS,
                 tracker=YOLO_TRACKER,
                 persist=YOLO_TRACK_PERSIST,
                 verbose=False,
@@ -393,14 +458,12 @@ def run_yolo_only(frame: np.ndarray) -> Tuple[List[Dict[str, Any]], float, float
                 half=YOLO_HALF,
                 iou=YOLO_IOU,
                 max_det=YOLO_MAX_DET,
+                agnostic_nms=YOLO_AGNOSTIC_NMS,
                 verbose=False,
             )
         if USE_CUDA:
             torch.cuda.synchronize()
     yolo_ms = (time.perf_counter() - yolo_started) * 1000
-
-    with state_lock:
-        lidar_pts = list(latest_lidar_points)
 
     post_started = time.perf_counter()
     detections: List[Dict[str, Any]] = []
@@ -662,16 +725,7 @@ def init():
 @app.route("/info", methods=["POST"])
 def info():
     """시뮬레이터 상태 tick에 대해 별도 제어 없이 정상 응답만 반환합니다."""
-    global latest_lidar_points
-    data = request.get_json(silent=True) or {}
-    lidar_points = data.get("lidarPoints", [])
-    if lidar_points:
-        angles = [p.get("angle") for p in lidar_points[:10]]
-        print(f"[info] count={len(lidar_points)} angles={angles}")  # 첫 번째 포인트 키 확인
-        with state_lock:
-            latest_lidar_points = lidar_points
     return jsonify({"status": "success", "control": ""})
-
 
 
 @app.route("/get_action", methods=["POST"])
@@ -781,6 +835,7 @@ def debug_state():
             "distanceFovDeg": YOLO_DISTANCE_FOV_DEG,
             "distanceClassHeightsM": CLASS_HEIGHTS_M,
             "conf": YOLO_CONF,
+            "agnosticNms": YOLO_AGNOSTIC_NMS,
             "latestFrameSeq": latest_frame_seq,
             "processedFrameSeq": processed_frame_seq,
             "requestCount": request_count,
@@ -821,6 +876,7 @@ def warmup_yolo() -> None:
                     half=YOLO_HALF,
                     iou=YOLO_IOU,
                     max_det=YOLO_MAX_DET,
+                    agnostic_nms=YOLO_AGNOSTIC_NMS,
                     verbose=False,
                 )
         if USE_CUDA:
